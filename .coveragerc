@@ -1,0 +1,4 @@
+[run]
+omit=*_internals.py*,*flowPlot.py*,*experimental
+
+
