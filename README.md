@@ -350,7 +350,7 @@ The completed [A100 real-execution sweep #5](https://github.com/SpryzenHell/inte
 | Buy | RK4 | -0.067921 bps | -0.073220 bps | +0.005299 bps | [-0.015657, +0.028869] | 99.8712% |
 | Sell | RK4 | +0.083079 bps | +0.078506 bps | +0.004574 bps | [-0.018580, +0.029351] | 99.8387% |
 
-These improvements are small, and both intervals include zero. The experiment does **not** demonstrate a reliable benefit and is far below the 2.4 bps target. The 12-hour sample is only one market window; results should be repeated over other dates before drawing broader conclusions. Full per-method, data-hash, latency and TensorRT details are in [the A100 study report](docs/results/FLOWOE_SWEEP5_2026-10-10.md).
+These improvements are small, and both intervals include zero. The experiment does **not** demonstrate a reliable benefit and is far below the 2.4 bps target. This historical run also predates the leakage-safe trailing feature normalizer and has no recorded FlowOE checkout SHA, so treat its slippage values as diagnostic-only rather than unbiased evidence. Rerun on the current source before assessing execution quality. The 12-hour sample is only one market window; results should be repeated over other dates before drawing broader conclusions. Full per-method, data-hash, latency and TensorRT details are in [the A100 study report](docs/results/FLOWOE_SWEEP5_2026-10-10.md).
 
 The speed/quality latency sweeps used a synthetic smoke checkpoint and synthetic book, not the real-trained model. The TensorRT INT8 engine built and ran, but its maximum output error was 0.0842 at batch 4 against a 0.05 acceptance limit, so its apparent raw speed did not pass the accuracy gate. Neither the TensorRT/fused speedup claim nor the combined sub-2 ms target is established.
 

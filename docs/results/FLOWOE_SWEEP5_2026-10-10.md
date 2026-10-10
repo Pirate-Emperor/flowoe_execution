@@ -46,6 +46,8 @@ The independent reconstruction/coverage checks passed. The data is historical ma
 
 ## Real-data execution evaluation
 
+**Validity caveat:** this run used the earlier feature-normalization path, before order-flow imbalance was changed to trailing-only statistics. Its evaluation features may therefore be affected by future-data leakage. The run also did not record the exact FlowOE checkout SHA. Keep these numbers for traceability only; do not accept them as unbiased evidence for an execution-quality claim. Rerun this study using the current leakage-safe features and record the exact source commit before interpreting policy performance.
+
 Configuration: buy and sell; order size 0.5 BTC; context length 32; horizon 8; training uses the first 60% of the time series and evaluation the final 40%; 20 epochs; seeds 7, 17 and 27; RK4 and fixed Euler with 2, 3, 4 or 6 steps. All six seed/side training jobs and evaluations passed. There were 144 non-overlapping evaluation windows per seed and side, reused across seed fits; these are 144 distinct time windows, not 432 independent market windows.
 
 The table below reports signed slippage against trade VWAP. Positive improvement means the strategy has lower signed slippage than TWAP. The paired 95% intervals in the last column were recomputed from the saved per-episode results by averaging each shared timestamp's values across the three model seeds, then applying a paired circular moving-block bootstrap (5 consecutive episodes per block, 5,000 resamples, bootstrap seed 7). They describe uncertainty over the single held-out time window conditional on these trained seeds, not variation across market days.
