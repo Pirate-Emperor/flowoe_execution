@@ -253,6 +253,8 @@ def main():
     ap.add_argument("--latent-modes", default="random", help="Comma-separated execution latent ablations")
     ap.add_argument("--temperatures", default="0.5,1,2", help="Positive schedule-temperature candidates")
     ap.add_argument("--quantity-grid", default="0.5,1,2,5,10", help="Execution-size sweep in BTCUSDT units")
+    ap.add_argument("--ridge-strengths", default="0.5,1,2,4,8,16,32,64,128,256",
+                    help="Positive ridge forecast strengths forwarded to each evaluation.")
     ap.add_argument("--dataset-label", default="unknown", help="Independent market window/date label")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cuda")
@@ -288,6 +290,13 @@ def main():
     if not quantity_grid or any(not np.isfinite(x) or x <= 0 for x in quantity_grid):
         ap.error("quantity-grid values must be finite and positive")
     args.quantity_grid = ",".join(f"{x:g}" for x in quantity_grid)
+    try:
+        ridge_strengths = sorted(set(float(x.strip()) for x in args.ridge_strengths.split(",") if x.strip()))
+    except ValueError:
+        ap.error("ridge-strengths must be comma-separated positive numbers")
+    if not ridge_strengths or any(not np.isfinite(x) or x <= 0 for x in ridge_strengths):
+        ap.error("ridge-strengths must be finite and positive")
+    args.ridge_strengths = ",".join(f"{x:g}" for x in ridge_strengths)
 
     fi = resolve_input(args.fi, "FI-2010")
     l2 = resolve_input(args.l2, "L2")
@@ -309,6 +318,7 @@ def main():
         "latent_modes": latent_modes,
         "temperatures": temperatures,
         "quantity_grid_btc": quantity_grid,
+        "ridge_strengths": ridge_strengths,
         "dataset_label": args.dataset_label,
         "epochs": args.epochs, "quantity": args.quantity, "train_ratio": args.train_ratio,
         "include_fused": args.include_fused, "runs": [],
@@ -352,6 +362,7 @@ def main():
                     "--latent-modes", args.latent_modes,
                     "--temperatures", args.temperatures,
                     "--quantity-grid", args.quantity_grid,
+                    "--ridge-strengths", args.ridge_strengths,
                     "--dataset-label", args.dataset_label,
                     "--max-l2-rows", "200000", "--report", str(eval_report),
                 ]
