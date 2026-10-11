@@ -114,6 +114,30 @@ def initial_state_for_mode(x0: torch.Tensor, mode: str) -> torch.Tensor:
     raise ValueError(f"unsupported latent mode: {mode}")
 
 
+def executable_price_series(snapshots, side: str, child_quantity: float, levels: int = 10) -> np.ndarray:
+    """Return the price to execute a fixed-size child at each snapshot, or NaN if depth is insufficient."""
+    if side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    if not np.isfinite(child_quantity) or child_quantity <= 0 or levels < 1:
+        raise ValueError("child quantity and levels must be finite and positive")
+    prefix = "ask" if side == "buy" else "bid"
+    out = np.full(len(snapshots), np.nan, dtype=np.float64)
+    for i, (_, row) in enumerate(snapshots.iterrows()):
+        remain, cost = float(child_quantity), 0.0
+        for level in range(levels):
+            price = float(row[f"{prefix}{level}"])
+            size = float(row[f"{prefix}_size{level}"])
+            if not np.isfinite(price) or price <= 0 or not np.isfinite(size) or size < 0:
+                raise ValueError("book prices/sizes must be finite with positive prices and non-negative sizes")
+            take = min(remain, size)
+            cost += take * price
+            remain -= take
+            if remain <= 1e-12:
+                out[i] = cost / child_quantity
+                break
+    return out
+
+
 def ridge_descriptor(context: np.ndarray, mode: str = "compact") -> np.ndarray:
     """Causal L2 descriptor: compact baseline or richer multi-scale temporal features."""
     x = np.asarray(context, dtype=np.float64)
@@ -154,17 +178,26 @@ def fit_ridge_forecaster(
         raise ValueError("features and mids must be aligned 2-D/1-D arrays")
     if not 0 < train_end <= len(x) or ctx_len < 8 or horizon < 1 or stride < 1:
         raise ValueError("invalid train boundary or forecast dimensions")
-    if not np.isfinite(x[:train_end]).all() or not np.isfinite(p[:train_end]).all() or (p[:train_end] <= 0).any():
-        raise ValueError("training data must be finite with positive mid prices")
+    if not np.isfinite(x[:train_end]).all() or np.isinf(p[:train_end]).any():
+        raise ValueError("training features/prices must be finite except for NaN depth-limited targets")
+    finite_p = p[:train_end][np.isfinite(p[:train_end])]
+    if (finite_p <= 0).any():
+        raise ValueError("finite training target prices must be positive")
     if not np.isfinite(regularization) or regularization <= 0:
         raise ValueError("regularization must be finite and positive")
     xs, ys = [], []
+    skipped_target_windows = 0
     for start in range(0, train_end - ctx_len - horizon + 1, stride):
         cut = start + ctx_len
+        future_prices = p[cut:cut + horizon]
+        anchor_price = p[cut - 1]
+        if not np.isfinite(anchor_price) or anchor_price <= 0 or not np.isfinite(future_prices).all():
+            skipped_target_windows += 1
+            continue
         xs.append(ridge_descriptor(x[start:cut], descriptor_mode))
-        ys.append(np.log(p[cut:cut + horizon] / p[cut - 1]) * 1e4)
+        ys.append(np.log(future_prices / anchor_price) * 1e4)
     if len(xs) < 2:
-        raise ValueError("not enough training windows for ridge forecaster")
+        raise ValueError(f"not enough valid target windows for ridge forecaster (skipped={skipped_target_windows})")
     xs = np.asarray(xs)
     ys = np.asarray(ys)
     x_mean, x_std = xs.mean(axis=0), xs.std(axis=0)
@@ -179,6 +212,7 @@ def fit_ridge_forecaster(
         "target_mean_bps": y_mean,
         "coefficients": beta,
         "train_windows": int(len(xs)),
+        "skipped_target_windows": int(skipped_target_windows),
         "train_end": int(train_end),
         "context_length": int(ctx_len),
         "horizon": int(horizon),
@@ -405,6 +439,18 @@ def main():
     ridge_temporal_model = fit_ridge_forecaster(
         features, mids, ntrain, ctx_len=CTX_LEN, horizon=HORIZON, descriptor_mode="temporal"
     )
+    ridge_exec_models = {}
+    ridge_exec_skips = {}
+    for quantity in quantity_grid:
+        child_quantity = float(quantity) / HORIZON
+        exec_price_path = executable_price_series(l2, args.side, child_quantity)
+        try:
+            ridge_exec_models[float(quantity)] = fit_ridge_forecaster(
+                features, exec_price_path, ntrain, ctx_len=CTX_LEN, horizon=HORIZON,
+                descriptor_mode="temporal",
+            )
+        except ValueError as exc:
+            ridge_exec_skips[str(quantity)] = str(exc)
     ridge_strengths = tuple(ridge_strengths)
     simulator = ExecutionSimulator(quantity=args.quantity, side=args.side)
     baselines: list[float] = []
@@ -478,6 +524,20 @@ def main():
         episode_record["twap_completion"] = twap.completion
 
         ridge_candidates = {}
+        quantity_specific_schedules = {}
+        for target_quantity, target_model in ridge_exec_models.items():
+            qkey = f"{target_quantity:g}".replace(".", "p")
+            quantity_specific_schedules[target_quantity] = {}
+            for strength in ridge_strengths:
+                pred_path, schedule = predict_ridge_schedule(
+                    target_model, features[i - CTX_LEN:i], args.side, strength,
+                )
+                method_key = f"ridge_exec_q{qkey}_s{strength:g}".replace(".", "p")
+                quantity_specific_schedules[target_quantity][method_key] = {
+                    "predicted_path_bps": pred_path,
+                    "schedule": schedule,
+                    "child_quantity": target_quantity / HORIZON,
+                }
         for strength in ridge_strengths:
             ridge_key = f"ridge_{strength:g}"
             pred_bps, schedule = predict_ridge_schedule(
@@ -698,6 +758,31 @@ def main():
                     "schedule_error": schedule_err,
                 }
 
+            for method_key, item in quantity_specific_schedules.get(float(quantity), {}).items():
+                schedule = item["schedule"]
+                result = qsim.run(
+                    window, schedule, benchmark="trade_vwap", trades=trades,
+                    benchmark_vwap=episode_vwap, strategy=method_key,
+                )
+                methods.setdefault(method_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
+                methods[method_key]["baseline"].append(qtwap.slippage_bps)
+                methods[method_key]["slippage"].append(result.slippage_bps)
+                methods[method_key]["completion"].append(result.completion)
+                schedule_tensor = torch.as_tensor(
+                    schedule, dtype=references[latent_modes[0]].dtype, device=device
+                ).unsqueeze(0)
+                schedule_err = compare_schedules(references[latent_modes[0]], schedule_tensor)
+                methods[method_key]["schedule_errors"].append(schedule_err)
+                episode_record["methods"][method_key] = {
+                    "slippage_bps": result.slippage_bps,
+                    "completion": result.completion,
+                    "quantity_btc": float(quantity),
+                    "child_quantity_btc": item["child_quantity"],
+                    "predicted_path_bps": item["predicted_path_bps"].tolist(),
+                    "schedule": schedule.tolist(),
+                    "forecaster": "side_specific_executable_price",
+                }
+
         episode_records.append(episode_record)
 
     summaries = {}
@@ -798,6 +883,16 @@ def main():
         "fused_extension_error": fused_error,
         "methods": summaries,
         "episode_results": episode_records,
+        "ridge_execution_cost_models": {
+            str(q): {
+                "child_quantity_btc": q / HORIZON,
+                "train_windows": model["train_windows"],
+                "skipped_target_windows": model["skipped_target_windows"],
+                "descriptor_mode": model["descriptor_mode"],
+            }
+            for q, model in ridge_exec_models.items()
+        },
+        "ridge_execution_cost_model_skips": ridge_exec_skips,
         "hindsight_oracle_notice": "hindsight_oracle_* methods use the future L2 execution window to select cheapest visible levels. They are deliberately non-deployable upper bounds for simulator headroom, not valid strategy results.",
         "note": "Execution-simulator slippage against market trade VWAP; no market-impact or real order-fill claim. Paired moving-block bootstrap uses 5 consecutive episodes per block. The data_source field is the caller-provided provenance label and must be supported by independent input validation.",
     }
