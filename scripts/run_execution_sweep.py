@@ -251,6 +251,7 @@ def main():
     ap.add_argument("--euler-steps", default="2,3,4,6")
     ap.add_argument("--latent-modes", default="random", help="Comma-separated execution latent ablations")
     ap.add_argument("--temperatures", default="0.5,1,2", help="Positive schedule-temperature candidates")
+    ap.add_argument("--quantity-grid", default="0.5,1,2,5,10", help="Execution-size sweep in BTCUSDT units")
     ap.add_argument("--dataset-label", default="unknown", help="Independent market window/date label")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--quantity", type=float, default=0.5)
@@ -278,6 +279,13 @@ def main():
     if not temperatures or any(not np.isfinite(x) or x <= 0 for x in temperatures):
         ap.error("temperatures must be finite and positive")
     args.temperatures = ",".join(f"{x:g}" for x in temperatures)
+    try:
+        quantity_grid = sorted(set(float(x) for x in args.quantity_grid.split(",") if x.strip()) | {float(args.quantity)})
+    except ValueError:
+        ap.error("quantity-grid must be comma-separated positive numbers")
+    if not quantity_grid or any(not np.isfinite(x) or x <= 0 for x in quantity_grid):
+        ap.error("quantity-grid values must be finite and positive")
+    args.quantity_grid = ",".join(f"{x:g}" for x in quantity_grid)
 
     fi = resolve_input(args.fi, "FI-2010")
     l2 = resolve_input(args.l2, "L2")
@@ -298,6 +306,7 @@ def main():
         "seeds": seeds, "sides": sides, "euler_steps": euler_steps,
         "latent_modes": latent_modes,
         "temperatures": temperatures,
+        "quantity_grid_btc": quantity_grid,
         "dataset_label": args.dataset_label,
         "epochs": args.epochs, "quantity": args.quantity, "train_ratio": args.train_ratio,
         "include_fused": args.include_fused, "runs": [],
@@ -339,6 +348,7 @@ def main():
                     "--euler-steps", ",".join(str(x) for x in euler_steps),
                     "--latent-modes", args.latent_modes,
                     "--temperatures", args.temperatures,
+                    "--quantity-grid", args.quantity_grid,
                     "--dataset-label", args.dataset_label,
                     "--max-l2-rows", "200000", "--report", str(eval_report),
                 ]

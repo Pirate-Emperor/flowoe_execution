@@ -249,3 +249,15 @@ def test_temperature_schedule_sharpens_flattens_and_validates():
         temperature_schedule(p, 0)
     with pytest.raises(ValueError, match="positive mass"):
         temperature_schedule(np.zeros(3), 1.0)
+
+
+
+def test_parse_quantity_grid_keeps_base_quantity_and_rejects_bad_sizes():
+    from scripts.evaluate_execution_grid import parse_quantity_grid, quantity_method_key
+
+    assert parse_quantity_grid("2,0.5,5,2", 1.0) == [0.5, 1.0, 2.0, 5.0]
+    assert quantity_method_key("fixed_euler_4", 0.5) == "fixed_euler_4_qty0p5"
+    with pytest.raises(ValueError, match="positive"):
+        parse_quantity_grid("1,-2", 0.5)
+    with pytest.raises(ValueError, match="positive"):
+        parse_quantity_grid("nan,2", 0.5)

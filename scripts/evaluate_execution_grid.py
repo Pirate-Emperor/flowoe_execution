@@ -226,6 +226,23 @@ def temperature_schedule(schedule: np.ndarray, temperature: float) -> np.ndarray
     return out
 
 
+def parse_quantity_grid(value: str, base_quantity: float) -> list[float]:
+    """Parse positive execution sizes (BTC for BTCUSDT), preserving the base size."""
+    try:
+        quantities = [float(x.strip()) for x in value.split(",") if x.strip()]
+    except ValueError as exc:
+        raise ValueError("quantity-grid must be comma-separated positive numbers") from exc
+    quantities = sorted(set(quantities + [float(base_quantity)]))
+    if not quantities or any(not np.isfinite(q) or q <= 0 for q in quantities):
+        raise ValueError("quantity-grid values must be finite and positive")
+    return quantities
+
+
+def quantity_method_key(method: str, quantity: float) -> str:
+    tag = f"{quantity:g}".replace(".", "p")
+    return f"{method}_qty{tag}"
+
+
 def evaluate_one(
     model: CFMPolicy,
     sampler: FixedStepCryptoSampler,
@@ -252,6 +269,7 @@ def main():
     ap.add_argument("--euler-steps", default="2,3,4,6")
     ap.add_argument("--latent-modes", default="random", help="Comma-separated modes: random,zero")
     ap.add_argument("--temperatures", default="0.5,1,2", help="Positive schedule-temperature candidates")
+    ap.add_argument("--quantity-grid", default="0.5,1,2,5,10", help="Execution size sweep in BTCUSDT units")
     ap.add_argument("--dataset-label", default="unknown", help="Independent market window/date label")
     ap.add_argument("--include-fused", action="store_true")
     ap.add_argument("--fused-max-error", type=float, default=1e-4)
@@ -279,6 +297,10 @@ def main():
         ap.error("temperatures must be comma-separated positive numbers")
     if not temperatures or any(not np.isfinite(x) or x <= 0 for x in temperatures):
         ap.error("temperatures must be finite and positive")
+    try:
+        quantity_grid = parse_quantity_grid(args.quantity_grid, args.quantity)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     checkpoint = Path(args.checkpoint)
     if not checkpoint.is_absolute():
@@ -369,8 +391,10 @@ def main():
             for mode, x_init in latent_states.items()
         }
         window = l2.iloc[i:i + HORIZON]
+        twap_schedule = np.full(HORIZON, 1.0 / HORIZON)
+        candidate_schedules = {"twap": twap_schedule}
         twap = simulator.run(
-            window, np.full(HORIZON, 1.0 / HORIZON),
+            window, twap_schedule,
             benchmark="trade_vwap", trades=trades, strategy="twap",
         )
         baselines.append(twap.slippage_bps)
@@ -385,6 +409,7 @@ def main():
                 ridge_model, features[i - CTX_LEN:i], args.side, strength,
             )
             ridge_candidates[strength] = {"predicted_path_bps": pred_bps, "schedule": schedule}
+            candidate_schedules[ridge_key] = schedule.copy()
             ridge_result = simulator.run(
                 window, schedule, benchmark="trade_vwap", trades=trades,
                 strategy=ridge_key,
@@ -408,6 +433,7 @@ def main():
             ref_schedule = reference[0].detach().cpu().numpy()
             suffix = "" if mode == "random" else f"_{mode}"
             rk4_key = f"rk4{suffix}"
+            candidate_schedules[rk4_key] = ref_schedule.copy()
             reference_result = simulator.run(
                 window, ref_schedule, benchmark="trade_vwap",
                 trades=trades, strategy=f"flowoe_{rk4_key}_{args.rk4_steps}",
@@ -444,6 +470,7 @@ def main():
                         disabled_fused.add(method_key)
                         continue
                 schedule = pred[0].detach().cpu().numpy()
+                candidate_schedules[method_key] = schedule.copy()
                 execution = simulator.run(
                     window, schedule, benchmark="trade_vwap", trades=trades,
                     strategy=method_key,
@@ -467,6 +494,7 @@ def main():
                         if temp != 1.0:
                             temp_key = f"{method_key}_temp{temp:g}"
                             temp_schedule = temperature_schedule(schedule, temp)
+                            candidate_schedules[temp_key] = temp_schedule.copy()
                             temp_result = simulator.run(
                                 window, temp_schedule, benchmark="trade_vwap",
                                 trades=trades, strategy=temp_key,
@@ -491,6 +519,7 @@ def main():
                             else:
                                 hybrid_base = f"hybrid_{key}_temp{temp:g}_ridge2_g{gamma:g}"
                             hybrid_key = hybrid_base if mode == "random" else f"{hybrid_base}_zero"
+                            candidate_schedules[hybrid_key] = blend.copy()
                             hybrid_result = simulator.run(
                                 window, blend, benchmark="trade_vwap", trades=trades,
                                 strategy=hybrid_key,
@@ -509,6 +538,39 @@ def main():
                                 "ridge_weight": gamma,
                                 "max_abs_error_vs_pytorch_euler": None,
                             }
+        # Re-score the exact same schedules at multiple order sizes.
+        # Each size gets its own TWAP, slippage, and completion figures.
+        for quantity in quantity_grid:
+            qsim = ExecutionSimulator(quantity=quantity, side=args.side)
+            qtwap = qsim.run(
+                window, twap_schedule, benchmark="trade_vwap",
+                trades=trades, strategy=f"twap_qty{quantity:g}",
+            )
+            for base_method, candidate_schedule in candidate_schedules.items():
+                quantity_key = quantity_method_key(base_method, quantity)
+                result = qsim.run(
+                    window, candidate_schedule, benchmark="trade_vwap",
+                    trades=trades, strategy=quantity_key,
+                )
+                prior = methods.get(base_method, {}).get("schedule_errors", [])
+                zero_error = {
+                    "mean_abs_error": 0.0, "max_abs_error": 0.0,
+                    "mean_kl_reference_to_candidate": 0.0,
+                }
+                schedule_err = prior[-1] if prior else zero_error
+                methods.setdefault(quantity_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
+                methods[quantity_key]["baseline"].append(qtwap.slippage_bps)
+                methods[quantity_key]["slippage"].append(result.slippage_bps)
+                methods[quantity_key]["completion"].append(result.completion)
+                methods[quantity_key]["schedule_errors"].append(schedule_err)
+                episode_record["methods"][quantity_key] = {
+                    "slippage_bps": result.slippage_bps,
+                    "completion": result.completion,
+                    "quantity_btc": float(quantity),
+                    "base_method": base_method,
+                    "schedule_error": schedule_err,
+                }
+
         episode_records.append(episode_record)
 
     summaries = {}
@@ -559,6 +621,7 @@ def main():
         "euler_steps": euler_steps,
         "latent_modes": latent_modes,
         "temperatures": temperatures,
+        "quantity_grid_btc": quantity_grid,
         "dataset_label": args.dataset_label,
         "ridge_forecaster": {
             "train_windows": ridge_model["train_windows"],
