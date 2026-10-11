@@ -14,8 +14,7 @@ from flowoe_execution.data import load_l2_csv
 from flowoe_execution.features import l2_features
 from flowoe_execution.model import CFMPolicy, FixedStepCryptoSampler
 from flowoe_execution.provenance import source_revision, utc_now, workflow_revision
-from scripts.benchmark_trt import output_error_metrics, stats
-from scripts.build_trt_engine import accuracy_gate
+from scripts.benchmark_trt import accuracy_gate, output_error_metrics, stats
 
 
 ROOT = Path(__file__).resolve().parents[1]
