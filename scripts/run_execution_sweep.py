@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import numpy as np
 import statistics
 import subprocess
 import sys
