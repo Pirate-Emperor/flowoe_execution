@@ -192,6 +192,25 @@ def predict_ridge_schedule(model: dict, context: np.ndarray, side: str, strength
     return pred_bps, schedule
 
 
+def blend_schedules(cfm: np.ndarray, ridge: np.ndarray, ridge_weight: float) -> np.ndarray:
+    """Geometrically blend two nonnegative execution distributions."""
+    p = np.asarray(cfm, dtype=np.float64)
+    q = np.asarray(ridge, dtype=np.float64)
+    if p.ndim != 1 or q.shape != p.shape or p.size == 0:
+        raise ValueError("schedules must be equal-length nonempty 1-D arrays")
+    if not np.isfinite(p).all() or not np.isfinite(q).all() or np.any(p < 0) or np.any(q < 0):
+        raise ValueError("schedules must be finite and non-negative")
+    if not np.isfinite(ridge_weight) or not 0.0 <= ridge_weight <= 1.0:
+        raise ValueError("ridge weight must be in [0,1]")
+    p = np.maximum(p / max(p.sum(), 1e-300), 1e-12)
+    q = np.maximum(q / max(q.sum(), 1e-300), 1e-12)
+    logits = (1.0 - ridge_weight) * np.log(p) + ridge_weight * np.log(q)
+    logits -= logits.max()
+    result = np.exp(logits)
+    result /= result.sum()
+    return result
+
+
 def evaluate_one(
     model: CFMPolicy,
     sampler: FixedStepCryptoSampler,
@@ -336,11 +355,13 @@ def main():
         episode_record["twap_slippage_bps"] = twap.slippage_bps
         episode_record["twap_completion"] = twap.completion
 
+        ridge_candidates = {}
         for strength in ridge_strengths:
             ridge_key = f"ridge_{strength:g}"
             pred_bps, schedule = predict_ridge_schedule(
                 ridge_model, features[i - CTX_LEN:i], args.side, strength,
             )
+            ridge_candidates[strength] = {"predicted_path_bps": pred_bps, "schedule": schedule}
             ridge_result = simulator.run(
                 window, schedule, benchmark="trade_vwap", trades=trades,
                 strategy=ridge_key,
@@ -417,6 +438,30 @@ def main():
                 }
                 if raw_error is not None:
                     episode_record["methods"][method_key]["max_abs_error_vs_pytorch_euler"] = raw_error
+
+                if key in {"fixed_euler_4", "fixed_euler_6"}:
+                    for gamma in (0.25, 0.5, 0.75):
+                        ridge_schedule = ridge_candidates[2.0]["schedule"]
+                        blend = blend_schedules(schedule, ridge_schedule, gamma)
+                        hybrid_base = f"hybrid_{key}_ridge2_g{gamma:g}"
+                        hybrid_key = hybrid_base if mode == "random" else f"{hybrid_base}_zero"
+                        hybrid_result = simulator.run(
+                            window, blend, benchmark="trade_vwap", trades=trades,
+                            strategy=hybrid_key,
+                        )
+                        methods.setdefault(hybrid_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
+                        methods[hybrid_key]["baseline"].append(twap.slippage_bps)
+                        methods[hybrid_key]["slippage"].append(hybrid_result.slippage_bps)
+                        methods[hybrid_key]["completion"].append(hybrid_result.completion)
+                        blend_tensor = torch.as_tensor(blend, dtype=reference.dtype, device=device).unsqueeze(0)
+                        methods[hybrid_key]["schedule_errors"].append(compare_schedules(reference, blend_tensor))
+                        episode_record["methods"][hybrid_key] = {
+                            "slippage_bps": hybrid_result.slippage_bps,
+                            "completion": hybrid_result.completion,
+                            "schedule": blend.tolist(),
+                            "ridge_weight": gamma,
+                            "max_abs_error_vs_pytorch_euler": None,
+                        }
         episode_records.append(episode_record)
 
     summaries = {}
@@ -474,6 +519,8 @@ def main():
             "stride": ridge_model["stride"],
             "regularization": ridge_model["regularization"],
             "schedule_strengths": list(ridge_strengths),
+            "hybrid_ridge_strength": 2.0,
+            "hybrid_ridge_weights": [0.25, 0.5, 0.75],
             "fit_uses_evaluation_rows": False,
         },
         "context_len": CTX_LEN,

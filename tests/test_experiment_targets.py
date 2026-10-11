@@ -142,3 +142,20 @@ def test_ridge_forecaster_uses_training_rows_only_and_returns_valid_schedules():
     assert (buy >= 0).all() and (sell >= 0).all()
     with pytest.raises(ValueError):
         predict_ridge_schedule(model_a, ctx, "hold", 1.0)
+
+
+
+def test_geometric_schedule_blend_endpoints_and_validation():
+    from scripts.evaluate_execution_grid import blend_schedules
+
+    p = np.array([0.7, 0.2, 0.1])
+    q = np.array([0.1, 0.3, 0.6])
+    np.testing.assert_allclose(blend_schedules(p, q, 0.0), p / p.sum(), atol=1e-12)
+    np.testing.assert_allclose(blend_schedules(p, q, 1.0), q / q.sum(), atol=1e-12)
+    middle = blend_schedules(p, q, 0.5)
+    assert np.isclose(middle.sum(), 1.0)
+    assert (middle > 0).all()
+    with pytest.raises(ValueError, match="in"):
+        blend_schedules(p, q, 1.1)
+    with pytest.raises(ValueError, match="finite"):
+        blend_schedules(np.array([0.1, np.nan, 0.9]), q, 0.5)
