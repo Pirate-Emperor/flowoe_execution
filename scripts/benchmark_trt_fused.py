@@ -220,7 +220,7 @@ def main():
                 ref_out = pytorch(ctx, x0.clone())
                 trt_out = combined(ctx, x0.clone())
                 batch_path_error = float((ref_out - trt_out).abs().max().item())
-            max_path_error_all_batches = max(max_path_error_all_batches, batch_path_error)
+                max_path_error_all_batches = max(max_path_error_all_batches, batch_path_error)
                 rk4_out = rk4_schedule(model, ctx, x0, steps=64)
                 refs.append(ref_out.detach())
                 candidates.append(trt_out.detach())
