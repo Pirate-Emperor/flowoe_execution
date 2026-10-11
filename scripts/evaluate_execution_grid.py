@@ -271,13 +271,17 @@ def main():
     ap.add_argument("--temperatures", default="0.5,1,2", help="Positive schedule-temperature candidates")
     ap.add_argument("--quantity-grid", default="0.5,1,2,5,10", help="Execution size sweep in BTCUSDT units")
     ap.add_argument("--dataset-label", default="unknown", help="Independent market window/date label")
+    ap.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cuda", help="Inference device; CPU mode disables fused CUDA testing.")
     ap.add_argument("--include-fused", action="store_true")
     ap.add_argument("--fused-max-error", type=float, default=1e-4)
     ap.add_argument("--max-l2-rows", type=int, default=200000)
     ap.add_argument("--report", default="results/execution_grid.json")
     args = ap.parse_args()
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA is unavailable")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("CUDA was requested but is unavailable")
+    device_name = "cuda" if args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available()) else "cpu"
+    if args.include_fused and device_name != "cuda":
+        ap.error("--include-fused requires --device cuda")
     if args.quantity <= 0 or not 0.1 <= args.train_ratio <= 0.9:
         ap.error("quantity must be positive and train-ratio must be in [0.1, 0.9]")
     if args.rk4_steps < 2 or args.max_l2_rows < 1 or args.fused_max_error <= 0:
@@ -322,7 +326,7 @@ def main():
     if overlap.empty or overlap.timestamp.min() > start + (end - start) * 0.05 or overlap.timestamp.max() < end - (end - start) * 0.05:
         raise SystemExit("Trade prints do not cover the full L2 evaluation period")
 
-    device = torch.device("cuda")
+    device = torch.device(device_name)
     model = CFMPolicy(8).to(device).eval()
     model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
     x_crypto = torch.from_numpy(features).to(device)
@@ -652,9 +656,10 @@ def main():
         "l2_sha256": sha256(l2_path),
         "trades_path": str(trade_path),
         "trades_sha256": sha256(trade_path),
-        "gpu": torch.cuda.get_device_name(0),
+        "device": str(device),
+        "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else None,
         "torch_version": torch.__version__,
-        "cuda_version": torch.version.cuda,
+        "cuda_version": torch.version.cuda if device.type == "cuda" else None,
         "fused_extension_error": fused_error,
         "methods": summaries,
         "episode_results": episode_records,
