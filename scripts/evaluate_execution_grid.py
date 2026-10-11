@@ -484,7 +484,6 @@ def main():
                                 "temperature": temp,
                             }
                         ridge_schedule = ridge_candidates[2.0]["schedule"]
-                        blend = blend_schedules(temperature_schedule(schedule, temp), ridge_schedule, 0.5) if temp != 1.0 else blend_schedules(schedule, ridge_schedule, 0.5)
                         for gamma in (0.25, 0.5, 0.75):
                             blend = blend_schedules(temperature_schedule(schedule, temp), ridge_schedule, gamma)
                             if temp == 1.0:
