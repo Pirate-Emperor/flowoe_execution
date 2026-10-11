@@ -331,7 +331,7 @@ def main():
         raise SystemExit("Chronological split leaves no train/evaluation window")
     mids = ((l2.bid0 + l2.ask0) / 2).to_numpy(dtype=np.float64)
     ridge_model = fit_ridge_forecaster(features, mids, ntrain, ctx_len=CTX_LEN, horizon=HORIZON)
-    ridge_strengths = (0.5, 1.0, 2.0, 4.0)
+    ridge_strengths = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
     simulator = ExecutionSimulator(quantity=args.quantity, side=args.side)
     baselines: list[float] = []
     base_completion: list[float] = []
