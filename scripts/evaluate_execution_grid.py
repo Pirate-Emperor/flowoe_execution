@@ -243,6 +243,50 @@ def quantity_method_key(method: str, quantity: float) -> str:
     return f"{method}_qty{tag}"
 
 
+def hindsight_oracle_schedule(snapshots, quantity: float, side: str, levels: int = 10):
+    """Non-deployable upper bound: allocate only to the cheapest observed future book levels.
+
+    This deliberately uses the full future execution window and must never be
+    reported as a live strategy. It estimates how much headroom the simulator
+    leaves for a causal forecast policy.
+    """
+    if side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    if not np.isfinite(quantity) or quantity <= 0 or levels < 1:
+        raise ValueError("quantity and levels must be finite and positive")
+    slots = []
+    for row_i, (_, row) in enumerate(snapshots.iterrows()):
+        prefix = "ask" if side == "buy" else "bid"
+        for level in range(levels):
+            price = float(row[f"{prefix}{level}"])
+            size = float(row[f"{prefix}_size{level}"])
+            if not np.isfinite(price) or price <= 0 or not np.isfinite(size) or size < 0:
+                raise ValueError("book prices/sizes must be finite with positive prices and non-negative sizes")
+            if size > 0:
+                slots.append((price, row_i, size))
+    slots.sort(key=lambda z: z[0], reverse=(side == "sell"))
+    alloc = np.zeros(len(snapshots), dtype=np.float64)
+    remaining = float(quantity)
+    for _, row_i, available in slots:
+        take = min(remaining, available)
+        alloc[row_i] += take
+        remaining -= take
+        if remaining <= 1e-12:
+            break
+    total_alloc = float(alloc.sum())
+    if total_alloc <= 0:
+        raise ValueError("no displayed depth is available in the execution window")
+    schedule = alloc / total_alloc
+    if not np.isfinite(schedule).all() or np.any(schedule < 0) or not np.isclose(schedule.sum(), 1.0):
+        raise RuntimeError("hindsight oracle schedule normalization failed")
+    return schedule, {
+        "requested_quantity": float(quantity),
+        "displayed_depth_selected": total_alloc,
+        "hindsight_fill_capacity": float(min(quantity, total_alloc)),
+        "capacity_limited": bool(total_alloc < quantity - 1e-12),
+    }
+
+
 def evaluate_one(
     model: CFMPolicy,
     sampler: FixedStepCryptoSampler,
@@ -559,6 +603,30 @@ def main():
                 window, twap_schedule, benchmark="trade_vwap",
                 trades=trades, benchmark_vwap=episode_vwap, strategy=f"twap_qty{quantity:g}",
             )
+            oracle_schedule, oracle_meta = hindsight_oracle_schedule(window, quantity, args.side)
+            oracle_key = quantity_method_key("hindsight_oracle", quantity)
+            oracle_result = qsim.run(
+                window, oracle_schedule, benchmark="trade_vwap", trades=trades,
+                benchmark_vwap=episode_vwap, strategy=oracle_key,
+            )
+            oracle_tensor = torch.as_tensor(
+                oracle_schedule, dtype=references[latent_modes[0]].dtype, device=device
+            ).unsqueeze(0)
+            oracle_err = compare_schedules(references[latent_modes[0]], oracle_tensor)
+            methods.setdefault(oracle_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
+            methods[oracle_key]["baseline"].append(qtwap.slippage_bps)
+            methods[oracle_key]["slippage"].append(oracle_result.slippage_bps)
+            methods[oracle_key]["completion"].append(oracle_result.completion)
+            methods[oracle_key]["schedule_errors"].append(oracle_err)
+            episode_record["methods"][oracle_key] = {
+                "slippage_bps": oracle_result.slippage_bps,
+                "completion": oracle_result.completion,
+                "quantity_btc": float(quantity),
+                "schedule": oracle_schedule.tolist(),
+                "schedule_error_vs_rk4": oracle_err,
+                **oracle_meta,
+                "is_hindsight_upper_bound_not_deployable": True,
+            }
             for base_method, candidate_schedule in candidate_schedules.items():
                 quantity_key = quantity_method_key(base_method, quantity)
                 result = qsim.run(
@@ -671,6 +739,7 @@ def main():
         "fused_extension_error": fused_error,
         "methods": summaries,
         "episode_results": episode_records,
+        "hindsight_oracle_notice": "hindsight_oracle_* methods use the future L2 execution window to select cheapest visible levels. They are deliberately non-deployable upper bounds for simulator headroom, not valid strategy results.",
         "note": "Execution-simulator slippage against market trade VWAP; no market-impact or real order-fill claim. Paired moving-block bootstrap uses 5 consecutive episodes per block. The data_source field is the caller-provided provenance label and must be supported by independent input validation.",
     }
     out = Path(args.report)
