@@ -270,6 +270,8 @@ def main():
     ap.add_argument("--latent-modes", default="random", help="Comma-separated modes: random,zero")
     ap.add_argument("--temperatures", default="0.5,1,2", help="Positive schedule-temperature candidates")
     ap.add_argument("--quantity-grid", default="0.5,1,2,5,10", help="Execution size sweep in BTCUSDT units")
+    ap.add_argument("--ridge-strengths", default="0.5,1,2,4,8,16,32,64,128,256",
+                    help="Positive ridge forecast strengths; tuned candidates must still pass fill and paired-CI checks.")
     ap.add_argument("--dataset-label", default="unknown", help="Independent market window/date label")
     ap.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cuda", help="Inference device; CPU mode disables fused CUDA testing.")
     ap.add_argument("--include-fused", action="store_true")
@@ -305,6 +307,12 @@ def main():
         quantity_grid = parse_quantity_grid(args.quantity_grid, args.quantity)
     except ValueError as exc:
         ap.error(str(exc))
+    try:
+        ridge_strengths = sorted(set(float(x.strip()) for x in args.ridge_strengths.split(",") if x.strip()))
+    except ValueError:
+        ap.error("ridge-strengths must be comma-separated positive numbers")
+    if not ridge_strengths or any(not np.isfinite(x) or x <= 0 for x in ridge_strengths):
+        ap.error("ridge-strengths must be finite and positive")
 
     checkpoint = Path(args.checkpoint)
     if not checkpoint.is_absolute():
@@ -335,7 +343,7 @@ def main():
         raise SystemExit("Chronological split leaves no train/evaluation window")
     mids = ((l2.bid0 + l2.ask0) / 2).to_numpy(dtype=np.float64)
     ridge_model = fit_ridge_forecaster(features, mids, ntrain, ctx_len=CTX_LEN, horizon=HORIZON)
-    ridge_strengths = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
+    ridge_strengths = tuple(ridge_strengths)
     simulator = ExecutionSimulator(quantity=args.quantity, side=args.side)
     baselines: list[float] = []
     base_completion: list[float] = []
