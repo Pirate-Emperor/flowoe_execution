@@ -79,6 +79,7 @@ class ExecutionSimulator:
         benchmark: str = "trade_vwap",
         trades: pd.DataFrame | None = None,
         strategy: str = "flowoe",
+        benchmark_vwap: float | None = None,
     ) -> ExecutionResult:
         if len(snapshots) < len(fractions):
             raise ValueError("Not enough snapshots for requested horizon")
@@ -112,10 +113,17 @@ class ExecutionSimulator:
         start = snapshots.iloc[0].timestamp
         end = snapshots.iloc[min(len(f) - 1, len(snapshots) - 1)].timestamp
         if benchmark == "trade_vwap":
-            if trades is None:
-                raise ValueError("trade_vwap requested without trade data")
-            vwap = market_vwap(trades, start, end)
+            if benchmark_vwap is not None:
+                vwap = float(benchmark_vwap)
+                if not np.isfinite(vwap) or vwap <= 0:
+                    raise ValueError("benchmark_vwap must be finite and positive")
+            else:
+                if trades is None:
+                    raise ValueError("trade_vwap requested without trade data or a cached VWAP")
+                vwap = market_vwap(trades, start, end)
         elif benchmark == "book_vwap":
+            if benchmark_vwap is not None:
+                raise ValueError("benchmark_vwap is only valid for trade_vwap")
             vwap = book_vwap(snapshots, start, end)
         else:
             raise ValueError("benchmark must be 'trade_vwap' or 'book_vwap'")

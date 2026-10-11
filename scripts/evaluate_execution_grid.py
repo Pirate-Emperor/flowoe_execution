@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from flowoe_execution.data import load_l2_csv, load_trades_csv
-from flowoe_execution.execution import ExecutionSimulator, make_schedule_from_trajectory
+from flowoe_execution.execution import ExecutionSimulator, make_schedule_from_trajectory, market_vwap
 from flowoe_execution.features import l2_features
 from flowoe_execution.metrics import paired_block_bootstrap_ci, summary_stats
 from flowoe_execution.model import CFMPolicy, FixedStepCryptoSampler
@@ -391,11 +391,12 @@ def main():
             for mode, x_init in latent_states.items()
         }
         window = l2.iloc[i:i + HORIZON]
+        episode_vwap = market_vwap(trades, window.iloc[0].timestamp, window.iloc[-1].timestamp)
         twap_schedule = np.full(HORIZON, 1.0 / HORIZON)
         candidate_schedules = {"twap": twap_schedule}
         twap = simulator.run(
             window, twap_schedule,
-            benchmark="trade_vwap", trades=trades, strategy="twap",
+            benchmark="trade_vwap", trades=trades, benchmark_vwap=episode_vwap, strategy="twap",
         )
         baselines.append(twap.slippage_bps)
         base_completion.append(twap.completion)
@@ -411,7 +412,7 @@ def main():
             ridge_candidates[strength] = {"predicted_path_bps": pred_bps, "schedule": schedule}
             candidate_schedules[ridge_key] = schedule.copy()
             ridge_result = simulator.run(
-                window, schedule, benchmark="trade_vwap", trades=trades,
+                window, schedule, benchmark="trade_vwap", trades=trades, benchmark_vwap=episode_vwap,
                 strategy=ridge_key,
             )
             methods.setdefault(ridge_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
@@ -436,7 +437,7 @@ def main():
             candidate_schedules[rk4_key] = ref_schedule.copy()
             reference_result = simulator.run(
                 window, ref_schedule, benchmark="trade_vwap",
-                trades=trades, strategy=f"flowoe_{rk4_key}_{args.rk4_steps}",
+                trades=trades, benchmark_vwap=episode_vwap, strategy=f"flowoe_{rk4_key}_{args.rk4_steps}",
             )
             methods.setdefault(rk4_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
             methods[rk4_key]["baseline"].append(twap.slippage_bps)
@@ -472,7 +473,7 @@ def main():
                 schedule = pred[0].detach().cpu().numpy()
                 candidate_schedules[method_key] = schedule.copy()
                 execution = simulator.run(
-                    window, schedule, benchmark="trade_vwap", trades=trades,
+                    window, schedule, benchmark="trade_vwap", trades=trades, benchmark_vwap=episode_vwap,
                     strategy=method_key,
                 )
                 methods.setdefault(method_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
@@ -497,7 +498,7 @@ def main():
                             candidate_schedules[temp_key] = temp_schedule.copy()
                             temp_result = simulator.run(
                                 window, temp_schedule, benchmark="trade_vwap",
-                                trades=trades, strategy=temp_key,
+                                trades=trades, benchmark_vwap=episode_vwap, strategy=temp_key,
                             )
                             methods.setdefault(temp_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
                             methods[temp_key]["baseline"].append(twap.slippage_bps)
@@ -521,7 +522,7 @@ def main():
                             hybrid_key = hybrid_base if mode == "random" else f"{hybrid_base}_zero"
                             candidate_schedules[hybrid_key] = blend.copy()
                             hybrid_result = simulator.run(
-                                window, blend, benchmark="trade_vwap", trades=trades,
+                                window, blend, benchmark="trade_vwap", trades=trades, benchmark_vwap=episode_vwap,
                                 strategy=hybrid_key,
                             )
                             methods.setdefault(hybrid_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
@@ -544,13 +545,13 @@ def main():
             qsim = ExecutionSimulator(quantity=quantity, side=args.side)
             qtwap = qsim.run(
                 window, twap_schedule, benchmark="trade_vwap",
-                trades=trades, strategy=f"twap_qty{quantity:g}",
+                trades=trades, benchmark_vwap=episode_vwap, strategy=f"twap_qty{quantity:g}",
             )
             for base_method, candidate_schedule in candidate_schedules.items():
                 quantity_key = quantity_method_key(base_method, quantity)
                 result = qsim.run(
                     window, candidate_schedule, benchmark="trade_vwap",
-                    trades=trades, strategy=quantity_key,
+                    trades=trades, benchmark_vwap=episode_vwap, strategy=quantity_key,
                 )
                 prior = methods.get(base_method, {}).get("schedule_errors", [])
                 zero_error = {

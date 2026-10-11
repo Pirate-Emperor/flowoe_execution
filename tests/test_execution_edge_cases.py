@@ -233,3 +233,42 @@ def test_execution_does_not_mutate_caller_schedule():
         book, schedule, benchmark="book_vwap",
     )
     np.testing.assert_array_equal(schedule, original)
+
+
+
+def test_precomputed_trade_vwap_is_used_without_scanning_trade_rows(monkeypatch):
+    import flowoe_execution.execution as execution_module
+
+    book = sample_l2(n=8)
+    trades = pd.DataFrame({
+        "timestamp": book.timestamp,
+        "price": np.linspace(99.9, 100.1, len(book)),
+        "qty": 1.0,
+    })
+    schedule = np.full(8, 1.0 / 8)
+    expected = market_vwap(trades, book.timestamp.iloc[0], book.timestamp.iloc[-1])
+    calls = 0
+    original = execution_module.market_vwap
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(execution_module, "market_vwap", counted)
+    sim = ExecutionSimulator(quantity=1.0, side="buy")
+    cached = sim.run(book, schedule, trades=trades, benchmark_vwap=expected)
+    assert calls == 0
+    uncached = sim.run(book, schedule, trades=trades)
+    assert calls == 1
+    assert cached.benchmark_vwap == pytest.approx(uncached.benchmark_vwap)
+    assert cached.slippage_bps == pytest.approx(uncached.slippage_bps)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_precomputed_trade_vwap_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="finite and positive"):
+        ExecutionSimulator().run(
+            sample_l2(), np.full(8, 1.0 / 8), benchmark="trade_vwap",
+            benchmark_vwap=value,
+        )
