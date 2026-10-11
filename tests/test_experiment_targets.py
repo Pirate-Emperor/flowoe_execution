@@ -231,3 +231,21 @@ def test_legacy_market_date_inference_handles_milliseconds_not_unix_prefix():
     stamp_ms = 1774396800000
     inferred = infer_market_date({"l2_window_start": stamp_ms})
     assert inferred == "2026-03-25"
+
+
+
+def test_temperature_schedule_sharpens_flattens_and_validates():
+    from scripts.evaluate_execution_grid import temperature_schedule
+
+    p = np.array([0.6, 0.3, 0.1])
+    sharp = temperature_schedule(p, 0.5)
+    flat = temperature_schedule(p, 2.0)
+    base = temperature_schedule(p, 1.0)
+    np.testing.assert_allclose(base, p, atol=1e-12)
+    assert sharp[0] > p[0] and sharp[-1] < p[-1]
+    assert flat[0] < p[0] and flat[-1] > p[-1]
+    assert np.isclose(sharp.sum(), 1.0) and (sharp > 0).all()
+    with pytest.raises(ValueError, match="temperature"):
+        temperature_schedule(p, 0)
+    with pytest.raises(ValueError, match="positive mass"):
+        temperature_schedule(np.zeros(3), 1.0)

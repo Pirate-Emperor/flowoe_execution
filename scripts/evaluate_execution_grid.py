@@ -211,6 +211,21 @@ def blend_schedules(cfm: np.ndarray, ridge: np.ndarray, ridge_weight: float) -> 
     return result
 
 
+def temperature_schedule(schedule: np.ndarray, temperature: float) -> np.ndarray:
+    """Sharpen/flatten a normalized execution schedule without changing its support."""
+    p = np.asarray(schedule, dtype=np.float64)
+    if p.ndim != 1 or p.size == 0 or not np.isfinite(p).all() or np.any(p < 0) or p.sum() <= 0:
+        raise ValueError("schedule must be finite, non-negative, nonempty, and have positive mass")
+    if not np.isfinite(temperature) or temperature <= 0:
+        raise ValueError("temperature must be finite and positive")
+    p = np.maximum(p / p.sum(), 1e-12)
+    logits = np.log(p) / temperature
+    logits -= logits.max()
+    out = np.exp(logits)
+    out /= out.sum()
+    return out
+
+
 def evaluate_one(
     model: CFMPolicy,
     sampler: FixedStepCryptoSampler,
@@ -236,6 +251,7 @@ def main():
     ap.add_argument("--rk4-steps", type=int, default=24)
     ap.add_argument("--euler-steps", default="2,3,4,6")
     ap.add_argument("--latent-modes", default="random", help="Comma-separated modes: random,zero")
+    ap.add_argument("--temperatures", default="0.5,1,2", help="Positive schedule-temperature candidates")
     ap.add_argument("--dataset-label", default="unknown", help="Independent market window/date label")
     ap.add_argument("--include-fused", action="store_true")
     ap.add_argument("--fused-max-error", type=float, default=1e-4)
@@ -257,6 +273,12 @@ def main():
     latent_modes = list(dict.fromkeys(x.strip() for x in args.latent_modes.split(",") if x.strip()))
     if not latent_modes or any(x not in {"random", "zero"} for x in latent_modes):
         ap.error("latent-modes must be a comma-separated subset of random,zero")
+    try:
+        temperatures = sorted(set(float(x) for x in args.temperatures.split(",") if x.strip()))
+    except ValueError:
+        ap.error("temperatures must be comma-separated positive numbers")
+    if not temperatures or any(not np.isfinite(x) or x <= 0 for x in temperatures):
+        ap.error("temperatures must be finite and positive")
 
     checkpoint = Path(args.checkpoint)
     if not checkpoint.is_absolute():
@@ -441,28 +463,53 @@ def main():
                     episode_record["methods"][method_key]["max_abs_error_vs_pytorch_euler"] = raw_error
 
                 if key in {"fixed_euler_4", "fixed_euler_6"}:
-                    for gamma in (0.25, 0.5, 0.75):
+                    for temp in temperatures:
+                        if temp != 1.0:
+                            temp_key = f"{method_key}_temp{temp:g}"
+                            temp_schedule = temperature_schedule(schedule, temp)
+                            temp_result = simulator.run(
+                                window, temp_schedule, benchmark="trade_vwap",
+                                trades=trades, strategy=temp_key,
+                            )
+                            methods.setdefault(temp_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
+                            methods[temp_key]["baseline"].append(twap.slippage_bps)
+                            methods[temp_key]["slippage"].append(temp_result.slippage_bps)
+                            methods[temp_key]["completion"].append(temp_result.completion)
+                            temp_tensor = torch.as_tensor(temp_schedule, dtype=reference.dtype, device=device).unsqueeze(0)
+                            methods[temp_key]["schedule_errors"].append(compare_schedules(reference, temp_tensor))
+                            episode_record["methods"][temp_key] = {
+                                "slippage_bps": temp_result.slippage_bps,
+                                "completion": temp_result.completion,
+                                "schedule": temp_schedule.tolist(),
+                                "temperature": temp,
+                            }
                         ridge_schedule = ridge_candidates[2.0]["schedule"]
-                        blend = blend_schedules(schedule, ridge_schedule, gamma)
-                        hybrid_base = f"hybrid_{key}_ridge2_g{gamma:g}"
-                        hybrid_key = hybrid_base if mode == "random" else f"{hybrid_base}_zero"
-                        hybrid_result = simulator.run(
-                            window, blend, benchmark="trade_vwap", trades=trades,
-                            strategy=hybrid_key,
-                        )
-                        methods.setdefault(hybrid_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
-                        methods[hybrid_key]["baseline"].append(twap.slippage_bps)
-                        methods[hybrid_key]["slippage"].append(hybrid_result.slippage_bps)
-                        methods[hybrid_key]["completion"].append(hybrid_result.completion)
-                        blend_tensor = torch.as_tensor(blend, dtype=reference.dtype, device=device).unsqueeze(0)
-                        methods[hybrid_key]["schedule_errors"].append(compare_schedules(reference, blend_tensor))
-                        episode_record["methods"][hybrid_key] = {
-                            "slippage_bps": hybrid_result.slippage_bps,
-                            "completion": hybrid_result.completion,
-                            "schedule": blend.tolist(),
-                            "ridge_weight": gamma,
-                            "max_abs_error_vs_pytorch_euler": None,
-                        }
+                        blend = blend_schedules(temperature_schedule(schedule, temp), ridge_schedule, 0.5) if temp != 1.0 else blend_schedules(schedule, ridge_schedule, 0.5)
+                        for gamma in (0.25, 0.5, 0.75):
+                            blend = blend_schedules(temperature_schedule(schedule, temp), ridge_schedule, gamma)
+                            if temp == 1.0:
+                                hybrid_base = f"hybrid_{key}_ridge2_g{gamma:g}"
+                            else:
+                                hybrid_base = f"hybrid_{key}_temp{temp:g}_ridge2_g{gamma:g}"
+                            hybrid_key = hybrid_base if mode == "random" else f"{hybrid_base}_zero"
+                            hybrid_result = simulator.run(
+                                window, blend, benchmark="trade_vwap", trades=trades,
+                                strategy=hybrid_key,
+                            )
+                            methods.setdefault(hybrid_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
+                            methods[hybrid_key]["baseline"].append(twap.slippage_bps)
+                            methods[hybrid_key]["slippage"].append(hybrid_result.slippage_bps)
+                            methods[hybrid_key]["completion"].append(hybrid_result.completion)
+                            blend_tensor = torch.as_tensor(blend, dtype=reference.dtype, device=device).unsqueeze(0)
+                            methods[hybrid_key]["schedule_errors"].append(compare_schedules(reference, blend_tensor))
+                            episode_record["methods"][hybrid_key] = {
+                                "slippage_bps": hybrid_result.slippage_bps,
+                                "completion": hybrid_result.completion,
+                                "schedule": blend.tolist(),
+                                "temperature": temp,
+                                "ridge_weight": gamma,
+                                "max_abs_error_vs_pytorch_euler": None,
+                            }
         episode_records.append(episode_record)
 
     summaries = {}
@@ -512,6 +559,7 @@ def main():
         "rk4_steps": args.rk4_steps,
         "euler_steps": euler_steps,
         "latent_modes": latent_modes,
+        "temperatures": temperatures,
         "dataset_label": args.dataset_label,
         "ridge_forecaster": {
             "train_windows": ridge_model["train_windows"],
