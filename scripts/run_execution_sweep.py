@@ -265,6 +265,10 @@ def main():
     sides = [x.strip() for x in args.sides.split(",") if x.strip()]
     if not sides or any(x not in {"buy", "sell"} for x in sides):
         ap.error("sides must be a comma-separated subset of buy,sell")
+    latent_modes = list(dict.fromkeys(x.strip() for x in args.latent_modes.split(",") if x.strip()))
+    if not latent_modes or any(x not in {"random", "zero"} for x in latent_modes):
+        ap.error("latent-modes must be a comma-separated subset of random,zero")
+    args.latent_modes = ",".join(latent_modes)
 
     fi = resolve_input(args.fi, "FI-2010")
     l2 = resolve_input(args.l2, "L2")
@@ -283,7 +287,7 @@ def main():
         "l2_path": str(l2), "l2_sha256": file_hash(l2),
         "trades_path": str(trades), "trades_sha256": file_hash(trades),
         "seeds": seeds, "sides": sides, "euler_steps": euler_steps,
-        "latent_modes": [x.strip() for x in args.latent_modes.split(",") if x.strip()],
+        "latent_modes": latent_modes,
         "epochs": args.epochs, "quantity": args.quantity, "train_ratio": args.train_ratio,
         "include_fused": args.include_fused, "runs": [],
     }

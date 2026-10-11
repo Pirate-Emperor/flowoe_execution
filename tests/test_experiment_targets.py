@@ -3,7 +3,7 @@ import torch
 import pytest
 
 from scripts.run_experiment import expert, fi_training_windows
-from scripts.evaluate_execution_grid import compare_schedules, summarize_paired_method
+from scripts.evaluate_execution_grid import compare_schedules, summarize_paired_method, initial_state_for_mode
 from scripts.benchmark_trt import accuracy_gate, latency_target_gate
 
 
@@ -95,3 +95,20 @@ def test_tensor_rt_gates_reject_invalid_thresholds():
         accuracy_gate(0.01, 0.0)
     with pytest.raises(ValueError, match="finite and positive"):
         latency_target_gate(True, 1.0, target_ms=float("inf"))
+
+
+
+def test_initial_state_ablation_random_clone_and_zero():
+    x = torch.tensor([[1.0, -2.0, 3.0]])
+    random_state = initial_state_for_mode(x, "random")
+    zero_state = initial_state_for_mode(x, "zero")
+    torch.testing.assert_close(random_state, x)
+    torch.testing.assert_close(zero_state, torch.zeros_like(x))
+    assert random_state.data_ptr() != x.data_ptr()
+    x[0, 0] = 99.0
+    assert random_state[0, 0].item() == pytest.approx(1.0)
+
+
+def test_initial_state_ablation_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="unsupported latent mode"):
+        initial_state_for_mode(torch.zeros(1, 8), "future")

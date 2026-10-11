@@ -66,7 +66,8 @@ def test_selu_converter_bypasses_dynamic_rank_helper():
         alpha = None
         beta = None
 
-        def get_output(self):
+        def get_output(self, index=0):
+            assert index == 0
             return "converted-selu"
 
     class FakeNetwork:
