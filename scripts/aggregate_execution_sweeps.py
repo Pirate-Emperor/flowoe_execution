@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -83,16 +84,38 @@ def load_reports(sweep_dirs: list[Path]) -> tuple[list[dict], list[dict]]:
     return reports, manifests
 
 
+def infer_market_date(report: dict) -> str:
+    """Infer a UTC calendar date for legacy reports lacking an explicit label."""
+    label = str(report.get("dataset_label", "unknown"))
+    if label != "unknown" and label:
+        return label
+    stamp = report.get("l2_window_start")
+    if stamp is None:
+        episodes = report.get("episode_results", [])
+        stamp = episodes[0].get("l2_start") if episodes else None
+    if stamp is None:
+        return "unknown"
+    raw = str(stamp)
+    if len(raw) >= 10 and raw[4:5] == "-" and raw[7:8] == "-":
+        return raw[:10]
+    try:
+        value = float(raw)
+        if abs(value) > 100_000_000_000:
+            value /= 1000.0
+        return datetime.fromtimestamp(value, tz=timezone.utc).date().isoformat()
+    except (ValueError, OverflowError, OSError):
+        return "unknown"
+
+
 def aggregate_cross_date(reports: list[dict], target_bps: float = 2.4,
                          min_dates: int = 3, n_boot: int = 5000) -> dict:
     """Average seeds within a market window, then compare paired windows to TWAP."""
     seed_maps: dict[tuple[str, str, str], dict[int, dict[str, dict]]] = {}
     seen_labels = set()
     for report in reports:
-        label = str(report.get("dataset_label", "unknown"))
-        if label == "unknown":
-            label = str(report.get("l2_window_start", "unknown"))[:10]
-        seen_labels.add(label)
+        label = infer_market_date(report)
+        if label != "unknown":
+            seen_labels.add(label)
         side = str(report["side"])
         seed = int(report["seed"])
         for episode in report.get("episode_results", []):

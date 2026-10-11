@@ -179,3 +179,55 @@ def test_cross_date_block_bootstrap_rejects_empty_or_nonfinite_series():
         cross_date_block_bootstrap_ci([])
     with pytest.raises(ValueError):
         cross_date_block_bootstrap_ci([[1.0, float("nan")]])
+
+
+
+def test_cross_date_aggregate_accepts_only_three_dates_three_seeds_and_ci():
+    from scripts.aggregate_execution_sweeps import aggregate_cross_date, render_markdown
+
+    reports = []
+    for day in ("2026-03-25", "2026-03-27", "2026-03-29"):
+        for seed in (7, 17, 27):
+            reports.append({
+                "dataset_label": day,
+                "side": "buy",
+                "seed": seed,
+                "episode_results": [{
+                    "l2_start": f"{day}T00:00:00Z",
+                    "l2_end": f"{day}T00:02:00Z",
+                    "twap_slippage_bps": 5.0,
+                    "methods": {"ridge_2": {"slippage_bps": 2.0, "completion": 0.999}},
+                }],
+            })
+    result = aggregate_cross_date(reports, target_bps=2.4, min_dates=3, n_boot=500)
+    metrics = result["aggregate"]["buy"]["ridge_2"]
+    assert result["observed_independent_dates"] == 3
+    assert metrics["independent_dates"] == 3
+    assert metrics["mean_improvement_equal_date_bps"] == pytest.approx(3.0)
+    assert metrics["cross_date_paired_bootstrap_ci95_bps"][0] > 0
+    assert metrics["accept_as_target_evidence"] is True
+    assert "## Cross-date summary\n" in render_markdown(result, [])
+
+
+def test_cross_date_aggregate_refuses_single_date_even_when_point_estimate_is_large():
+    from scripts.aggregate_execution_sweeps import aggregate_cross_date
+
+    reports = [{
+        "dataset_label": "2026-03-25", "side": "buy", "seed": seed,
+        "episode_results": [{
+            "l2_start": "2026-03-25T00:00:00Z", "l2_end": "2026-03-25T00:02:00Z",
+            "twap_slippage_bps": 9.0,
+            "methods": {"policy": {"slippage_bps": 0.0, "completion": 1.0}},
+        }],
+    } for seed in (7, 17, 27)]
+    result = aggregate_cross_date(reports, target_bps=2.4, min_dates=3, n_boot=500)
+    assert result["aggregate"]["buy"]["policy"]["mean_improvement_equal_date_bps"] == pytest.approx(9.0)
+    assert result["aggregate"]["buy"]["policy"]["accept_as_target_evidence"] is False
+
+
+def test_legacy_market_date_inference_handles_milliseconds_not_unix_prefix():
+    from scripts.aggregate_execution_sweeps import infer_market_date
+
+    stamp_ms = 1774396800000
+    inferred = infer_market_date({"l2_window_start": stamp_ms})
+    assert inferred == "2026-03-25"
