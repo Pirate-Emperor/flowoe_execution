@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from scripts.benchmark_trt import accuracy_gate, latency_target_gate, output_error_metrics
+from scripts.build_trt_engine import add_selu_activation, calibration_noise
 
 
 def test_output_error_metrics_are_zero_for_matching_schedules():
@@ -41,3 +42,60 @@ def test_latency_gate_does_not_accept_exactly_two_milliseconds():
     assert latency_target_gate(True, 1.99)["latency_claim_allowed"] is True
     assert latency_target_gate(True, 2.0)["latency_claim_allowed"] is False
     assert latency_target_gate(False, 1.0)["latency_claim_allowed"] is False
+
+
+
+def test_int8_calibration_noise_is_reproducible_and_not_repeated():
+    x = torch.zeros((1, 8), dtype=torch.float32)
+    a = calibration_noise(x, count=16, seed=99)
+    b = calibration_noise(x, count=16, seed=99)
+    c = calibration_noise(x, count=16, seed=100)
+    assert len(a) == 16
+    assert all(torch.equal(u, v) for u, v in zip(a, b))
+    assert not torch.equal(a[0], a[1])
+    assert not torch.equal(a[0], c[0])
+
+
+def test_calibration_noise_rejects_nonpositive_count():
+    with pytest.raises(ValueError, match="positive"):
+        calibration_noise(torch.zeros((1, 8)), count=0)
+
+
+def test_selu_converter_bypasses_dynamic_rank_helper():
+    class FakeLayer:
+        alpha = None
+        beta = None
+
+        def get_output(self):
+            return "converted-selu"
+
+    class FakeNetwork:
+        def __init__(self):
+            self.args = None
+            self.layer = FakeLayer()
+
+        def add_activation(self, tensor, activation):
+            self.args = (tensor, activation)
+            return self.layer
+
+    class FakeTRT:
+        class ActivationType:
+            SELU = "SELU"
+
+    network = FakeNetwork()
+    converted = object()
+    value = type("TensorProxy", (), {"_trt": converted})()
+    out = add_selu_activation(network, value, FakeTRT)
+    assert out == "converted-selu"
+    assert network.args == (converted, "SELU")
+    assert network.layer.alpha == pytest.approx(1.6732632423543772)
+    assert network.layer.beta == pytest.approx(1.0507009873554805)
+
+
+def test_selu_converter_rejects_tensor_without_trt_value():
+    class FakeTRT:
+        class ActivationType:
+            SELU = "SELU"
+
+    with pytest.raises(RuntimeError, match="not been converted"):
+        add_selu_activation(object(), object(), FakeTRT)
