@@ -114,12 +114,23 @@ def initial_state_for_mode(x0: torch.Tensor, mode: str) -> torch.Tensor:
     raise ValueError(f"unsupported latent mode: {mode}")
 
 
-def ridge_descriptor(context: np.ndarray) -> np.ndarray:
-    """Compact causal descriptor: latest L2 features plus recent 8-row mean."""
+def ridge_descriptor(context: np.ndarray, mode: str = "compact") -> np.ndarray:
+    """Causal L2 descriptor: compact baseline or richer multi-scale temporal features."""
     x = np.asarray(context, dtype=np.float64)
     if x.ndim != 2 or x.shape[0] < 8 or not np.isfinite(x).all():
         raise ValueError("context must be a finite (T,D) array with T >= 8")
-    return np.concatenate([x[-1], x[-8:].mean(axis=0)])
+    if mode == "compact":
+        return np.concatenate([x[-1], x[-8:].mean(axis=0)])
+    if mode != "temporal":
+        raise ValueError("descriptor mode must be compact or temporal")
+    means = [x[-min(w, len(x)):].mean(axis=0) for w in (4, 8, 16, 32)]
+    slopes = []
+    for n in (min(8, len(x)), len(x)):
+        recent = x[-n:]
+        t = np.arange(n, dtype=np.float64)
+        t -= t.mean()
+        slopes.append((t[:, None] * (recent - recent.mean(axis=0))).sum(axis=0) / max(float(t @ t), 1e-12))
+    return np.concatenate([x[-1], *means, *slopes])
 
 
 def fit_ridge_forecaster(
@@ -130,6 +141,7 @@ def fit_ridge_forecaster(
     horizon: int = HORIZON,
     stride: int = 8,
     regularization: float = 10.0,
+    descriptor_mode: str = "compact",
 ) -> dict:
     """Fit a multi-horizon price-change ridge model using training rows only.
 
@@ -149,7 +161,7 @@ def fit_ridge_forecaster(
     xs, ys = [], []
     for start in range(0, train_end - ctx_len - horizon + 1, stride):
         cut = start + ctx_len
-        xs.append(ridge_descriptor(x[start:cut]))
+        xs.append(ridge_descriptor(x[start:cut], descriptor_mode))
         ys.append(np.log(p[cut:cut + horizon] / p[cut - 1]) * 1e4)
     if len(xs) < 2:
         raise ValueError("not enough training windows for ridge forecaster")
@@ -172,6 +184,7 @@ def fit_ridge_forecaster(
         "horizon": int(horizon),
         "stride": int(stride),
         "regularization": float(regularization),
+        "descriptor_mode": descriptor_mode,
     }
 
 
@@ -179,7 +192,7 @@ def predict_ridge_schedule(model: dict, context: np.ndarray, side: str, strength
     """Convert causal ridge price forecasts into a normalized child-order schedule."""
     if side not in {"buy", "sell"} or not np.isfinite(strength) or strength <= 0:
         raise ValueError("side must be buy/sell and strength must be finite and positive")
-    desc = ridge_descriptor(context)
+    desc = ridge_descriptor(context, model.get("descriptor_mode", "compact"))
     pred_bps = ((desc - model["feature_mean"]) / model["feature_std"]) @ model["coefficients"]
     pred_bps = pred_bps + model["target_mean_bps"]
     sign = 1.0 if side == "buy" else -1.0
@@ -386,7 +399,12 @@ def main():
     if ntrain <= CTX_LEN + HORIZON or ntrain >= len(l2) - HORIZON:
         raise SystemExit("Chronological split leaves no train/evaluation window")
     mids = ((l2.bid0 + l2.ask0) / 2).to_numpy(dtype=np.float64)
-    ridge_model = fit_ridge_forecaster(features, mids, ntrain, ctx_len=CTX_LEN, horizon=HORIZON)
+    ridge_model = fit_ridge_forecaster(
+        features, mids, ntrain, ctx_len=CTX_LEN, horizon=HORIZON, descriptor_mode="compact"
+    )
+    ridge_temporal_model = fit_ridge_forecaster(
+        features, mids, ntrain, ctx_len=CTX_LEN, horizon=HORIZON, descriptor_mode="temporal"
+    )
     ridge_strengths = tuple(ridge_strengths)
     simulator = ExecutionSimulator(quantity=args.quantity, side=args.side)
     baselines: list[float] = []
@@ -482,6 +500,34 @@ def main():
                 "completion": ridge_result.completion,
                 "predicted_path_bps": pred_bps.tolist(),
                 "schedule": schedule.tolist(),
+                "forecaster": "compact",
+            }
+
+            temporal_key = f"ridge_temporal_{strength:g}"
+            temporal_pred_bps, temporal_schedule = predict_ridge_schedule(
+                ridge_temporal_model, features[i - CTX_LEN:i], args.side, strength,
+            )
+            candidate_schedules[temporal_key] = temporal_schedule.copy()
+            temporal_result = simulator.run(
+                window, temporal_schedule, benchmark="trade_vwap", trades=trades,
+                benchmark_vwap=episode_vwap, strategy=temporal_key,
+            )
+            methods.setdefault(temporal_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
+            methods[temporal_key]["baseline"].append(twap.slippage_bps)
+            methods[temporal_key]["slippage"].append(temporal_result.slippage_bps)
+            methods[temporal_key]["completion"].append(temporal_result.completion)
+            temporal_tensor = torch.as_tensor(
+                temporal_schedule, dtype=references[latent_modes[0]].dtype, device=device
+            ).unsqueeze(0)
+            methods[temporal_key]["schedule_errors"].append(
+                compare_schedules(references[latent_modes[0]], temporal_tensor)
+            )
+            episode_record["methods"][temporal_key] = {
+                "slippage_bps": temporal_result.slippage_bps,
+                "completion": temporal_result.completion,
+                "predicted_path_bps": temporal_pred_bps.tolist(),
+                "schedule": temporal_schedule.tolist(),
+                "forecaster": "temporal_multi_scale",
             }
 
         for mode in latent_modes:
@@ -711,9 +757,22 @@ def main():
             "horizon": ridge_model["horizon"],
             "stride": ridge_model["stride"],
             "regularization": ridge_model["regularization"],
+            "descriptor_mode": ridge_model["descriptor_mode"],
             "schedule_strengths": list(ridge_strengths),
             "hybrid_ridge_strength": 2.0,
             "hybrid_ridge_weights": [0.25, 0.5, 0.75],
+            "fit_uses_evaluation_rows": False,
+        },
+        "ridge_temporal_forecaster": {
+            "train_windows": ridge_temporal_model["train_windows"],
+            "train_end_index_exclusive": ridge_temporal_model["train_end"],
+            "context_length": ridge_temporal_model["context_length"],
+            "horizon": ridge_temporal_model["horizon"],
+            "stride": ridge_temporal_model["stride"],
+            "regularization": ridge_temporal_model["regularization"],
+            "descriptor_mode": ridge_temporal_model["descriptor_mode"],
+            "descriptor_components": ["last", "means_4_8_16_32", "slope_8", "slope_32"],
+            "schedule_strengths": list(ridge_strengths),
             "fit_uses_evaluation_rows": False,
         },
         "context_len": CTX_LEN,
