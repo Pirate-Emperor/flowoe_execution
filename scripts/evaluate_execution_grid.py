@@ -239,9 +239,12 @@ def main():
         # and schedule differences paired rather than noise-confounded.
         gen = torch.Generator(device=device)
         gen.manual_seed(args.seed + episode_idx)
-        x0 = torch.randn((1, HORIZON), generator=gen, device=device)
-        reference = rk4_from_initial_noise(model, ctx, x0, args.rk4_steps)
-        ref_schedule = reference[0].detach().cpu().numpy()
+        x_random = torch.randn((1, HORIZON), generator=gen, device=device)
+        latent_states = {mode: initial_state_for_mode(x_random, mode) for mode in latent_modes}
+        references = {
+            mode: rk4_from_initial_noise(model, ctx, x_init, args.rk4_steps)
+            for mode, x_init in latent_states.items()
+        }
         window = l2.iloc[i:i + HORIZON]
         twap = simulator.run(
             window, np.full(HORIZON, 1.0 / HORIZON),
@@ -251,60 +254,66 @@ def main():
         base_completion.append(twap.completion)
         episode_record["twap_slippage_bps"] = twap.slippage_bps
         episode_record["twap_completion"] = twap.completion
-        methods.setdefault("rk4", {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
-        methods["rk4"]["baseline"].append(twap.slippage_bps)
-        methods["rk4"]["slippage"].append(twap.slippage_bps)
-        methods["rk4"]["completion"].append(twap.completion)
-        methods["rk4"]["schedule_errors"].append({
-            "mean_abs_error": 0.0, "max_abs_error": 0.0,
-            "mean_kl_reference_to_candidate": 0.0,
-        })
 
-        reference_result = simulator.run(
-            window, ref_schedule, benchmark="trade_vwap",
-            trades=trades, strategy=f"flowoe_rk4_{args.rk4_steps}",
-        )
-        methods["rk4"]["slippage"][-1] = reference_result.slippage_bps
-        methods["rk4"]["completion"][-1] = reference_result.completion
-        episode_record["methods"]["rk4"] = {
-            "slippage_bps": reference_result.slippage_bps,
-            "completion": reference_result.completion,
-            "schedule_error": {"mean_abs_error": 0.0, "max_abs_error": 0.0, "mean_kl_reference_to_candidate": 0.0},
-        }
-        for key, sampler in samplers.items():
-            if key in disabled_fused:
-                continue
-            pred = evaluate_one(model, sampler, ctx, x0)
-            raw_error = None
-            if key.startswith("fused_euler_"):
-                ref_key = key.replace("fused_euler_", "fixed_euler_")
-                ref_pred = samplers[ref_key](ctx, x0.clone())
-                raw_error = float((pred - ref_pred).abs().max().item())
-                if raw_error > args.fused_max_error:
-                    fused_error = (
-                        f"{key} max output error {raw_error:.8g} exceeded "
-                        f"tolerance {args.fused_max_error:.8g} at episode {episode_idx}"
-                    )
-                    disabled_fused.add(key)
-                    continue
-            schedule = pred[0].detach().cpu().numpy()
-            execution = simulator.run(
-                window, schedule, benchmark="trade_vwap", trades=trades,
-                strategy=key,
+        for mode in latent_modes:
+            x_init = latent_states[mode]
+            reference = references[mode]
+            ref_schedule = reference[0].detach().cpu().numpy()
+            suffix = "" if mode == "random" else f"_{mode}"
+            rk4_key = f"rk4{suffix}"
+            reference_result = simulator.run(
+                window, ref_schedule, benchmark="trade_vwap",
+                trades=trades, strategy=f"flowoe_{rk4_key}_{args.rk4_steps}",
             )
-            methods.setdefault(key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
-            methods[key]["baseline"].append(twap.slippage_bps)
-            methods[key]["slippage"].append(execution.slippage_bps)
-            methods[key]["completion"].append(execution.completion)
-            err = compare_schedules(reference, pred)
-            methods[key]["schedule_errors"].append(err)
-            episode_record["methods"][key] = {
-                "slippage_bps": execution.slippage_bps,
-                "completion": execution.completion,
-                "schedule_error": err,
+            methods.setdefault(rk4_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
+            methods[rk4_key]["baseline"].append(twap.slippage_bps)
+            methods[rk4_key]["slippage"].append(reference_result.slippage_bps)
+            methods[rk4_key]["completion"].append(reference_result.completion)
+            methods[rk4_key]["schedule_errors"].append({
+                "mean_abs_error": 0.0, "max_abs_error": 0.0,
+                "mean_kl_reference_to_candidate": 0.0,
+            })
+            episode_record["methods"][rk4_key] = {
+                "slippage_bps": reference_result.slippage_bps,
+                "completion": reference_result.completion,
+                "schedule_error": {"mean_abs_error": 0.0, "max_abs_error": 0.0, "mean_kl_reference_to_candidate": 0.0},
             }
-            if raw_error is not None:
-                episode_record["methods"][key]["max_abs_error_vs_pytorch_euler"] = raw_error
+
+            for key, sampler in samplers.items():
+                method_key = key if mode == "random" else f"{key}_{mode}"
+                if method_key in disabled_fused:
+                    continue
+                pred = evaluate_one(model, sampler, ctx, x_init)
+                raw_error = None
+                if key.startswith("fused_euler_"):
+                    ref_key = key.replace("fused_euler_", "fixed_euler_")
+                    ref_pred = samplers[ref_key](ctx, x_init.clone())
+                    raw_error = float((pred - ref_pred).abs().max().item())
+                    if raw_error > args.fused_max_error:
+                        fused_error = (
+                            f"{method_key} max output error {raw_error:.8g} exceeded "
+                            f"tolerance {args.fused_max_error:.8g} at episode {episode_idx}"
+                        )
+                        disabled_fused.add(method_key)
+                        continue
+                schedule = pred[0].detach().cpu().numpy()
+                execution = simulator.run(
+                    window, schedule, benchmark="trade_vwap", trades=trades,
+                    strategy=method_key,
+                )
+                methods.setdefault(method_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
+                methods[method_key]["baseline"].append(twap.slippage_bps)
+                methods[method_key]["slippage"].append(execution.slippage_bps)
+                methods[method_key]["completion"].append(execution.completion)
+                err = compare_schedules(reference, pred)
+                methods[method_key]["schedule_errors"].append(err)
+                episode_record["methods"][method_key] = {
+                    "slippage_bps": execution.slippage_bps,
+                    "completion": execution.completion,
+                    "schedule_error": err,
+                }
+                if raw_error is not None:
+                    episode_record["methods"][method_key]["max_abs_error_vs_pytorch_euler"] = raw_error
         episode_records.append(episode_record)
 
     summaries = {}
@@ -353,6 +362,7 @@ def main():
         "train_ratio": args.train_ratio,
         "rk4_steps": args.rk4_steps,
         "euler_steps": euler_steps,
+        "latent_modes": latent_modes,
         "context_len": CTX_LEN,
         "horizon": HORIZON,
         "evaluation_stride_snapshots": HORIZON * 3,
