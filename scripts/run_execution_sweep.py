@@ -346,6 +346,7 @@ def main():
                     "--l2", str(l2), "--trades", str(trades),
                     "--data-source", "public_futures",
                     "--side", side, "--quantity", str(args.quantity),
+                    "--device", str(args.device),
                     "--train-ratio", str(args.train_ratio), "--seed", str(seed),
                     "--euler-steps", ",".join(str(x) for x in euler_steps),
                     "--latent-modes", args.latent_modes,
