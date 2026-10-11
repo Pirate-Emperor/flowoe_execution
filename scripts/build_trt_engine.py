@@ -14,8 +14,20 @@ from flowoe_execution.provenance import source_revision, utc_now, workflow_revis
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def calibration_contexts(context, x, count=32, prefer_real=False):
-    """Use data that matches the checkpoint where available."""
+def calibration_noise(x, count: int, seed: int = 20261011):
+    """Generate reproducible, distinct initial states for INT8 calibration."""
+    if count < 1:
+        raise ValueError("calibration count must be positive")
+    generator = torch.Generator(device=x.device)
+    generator.manual_seed(int(seed))
+    return [
+        torch.randn(x.shape, dtype=x.dtype, device=x.device, generator=generator)
+        for _ in range(count)
+    ]
+
+
+def calibration_contexts(context, x, count=256, prefer_real=False, seed=20261011):
+    """Use representative market contexts and reproducible initial states."""
     real_names = sorted(
         str(p.relative_to(ROOT))
         for p in (ROOT / "data/real/crypto").glob("*_l2.csv")
@@ -23,6 +35,7 @@ def calibration_contexts(context, x, count=32, prefer_real=False):
     names = (real_names + ["data/smoke/crypto_l2.csv"]) if prefer_real else (
         ["data/smoke/crypto_l2.csv"] + real_names
     )
+    noise = calibration_noise(x, count, seed)
     for name in names:
         path = ROOT / name
         if not path.exists():
@@ -39,22 +52,42 @@ def calibration_contexts(context, x, count=32, prefer_real=False):
             return [
                 {
                     "context": torch.from_numpy(features[i:i + context.shape[1]]).unsqueeze(0).to(context.device),
-                    "x": torch.randn_like(x),
+                    "x": noise[j],
                 }
-                for i in starts
+                for j, i in enumerate(starts)
             ], source
         except Exception:
             continue
+    generator = torch.Generator(device=context.device)
+    generator.manual_seed(int(seed) + 1)
     return [
-        {"context": torch.randn_like(context), "x": torch.randn_like(x)}
-        for _ in range(count)
+        {
+            "context": torch.randn(context.shape, dtype=context.dtype, device=context.device, generator=generator),
+            "x": noise[i],
+        }
+        for i in range(count)
     ], "random fallback (no valid L2 inputs found)"
+
+
+def add_selu_activation(network, value, trt_module):
+    """Add SELU directly to an already-converted TensorRT tensor.
+
+    Avoid torch2trt_dynamic.trt_ here: its rank inference fails for a dynamic
+    shape tensor on some TensorRT 10.5 converter builds.
+    """
+    tensor = getattr(value, "_trt", None)
+    if tensor is None:
+        raise RuntimeError("SELU input has not been converted to a TensorRT tensor")
+    layer = network.add_activation(tensor, trt_module.ActivationType.SELU)
+    layer.alpha = 1.6732632423543772
+    layer.beta = 1.0507009873554805
+    return layer.get_output(0)
 
 
 def register_selu_converter():
     """Register the exact PyTorch SELU parameters with TensorRT's native SELU layer."""
     import tensorrt as trt
-    from torch2trt_dynamic.torch2trt_dynamic import tensorrt_converter, trt_
+    from torch2trt_dynamic.torch2trt_dynamic import tensorrt_converter
 
     @tensorrt_converter("torch.nn.SELU.forward")
     @tensorrt_converter("torch.nn.modules.activation.SELU.forward")
@@ -71,12 +104,7 @@ def register_selu_converter():
         )
         if value is None:
             raise RuntimeError(f"Could not find tensor input for SELU: {ctx.method_args!r}")
-        layer = ctx.network.add_activation(
-            trt_(ctx.network, value), trt.ActivationType.SELU
-        )
-        layer.alpha = 1.6732632423543772
-        layer.beta = 1.0507009873554805
-        ctx.method_return._trt = layer.get_output(0)
+        ctx.method_return._trt = add_selu_activation(ctx.network, value, trt)
 
 
 def main():
@@ -84,7 +112,8 @@ def main():
     ap.add_argument("--checkpoint", default="results/cfm_policy_smoke.pt")
     ap.add_argument("--steps", type=int, default=4)
     ap.add_argument("--output", default="results/flowoe_int8.pth")
-    ap.add_argument("--calibration-size", type=int, default=32)
+    ap.add_argument("--calibration-size", type=int, default=256)
+    ap.add_argument("--calibration-seed", type=int, default=20261011)
     args = ap.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA not available")
@@ -106,7 +135,9 @@ def main():
     context = torch.zeros(1, 32, 45, device="cuda")
     x = torch.zeros(1, 8, device="cuda")
     calibration, calibration_source = calibration_contexts(
-        context, x, args.calibration_size, prefer_real=checkpoint.name == "cfm_policy.pt"
+        context, x, args.calibration_size,
+        prefer_real=checkpoint.name == "cfm_policy.pt",
+        seed=args.calibration_seed,
     )
 
     cfg = BuildEngineConfig(
@@ -135,6 +166,7 @@ def main():
         "gpu": torch.cuda.get_device_name(0),
         "steps": args.steps,
         "calibration_samples": len(calibration),
+        "calibration_seed": args.calibration_seed,
         "calibration_source": calibration_source,
         "engine_path": str(out),
         "checkpoint_path": str(checkpoint),
