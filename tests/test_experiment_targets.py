@@ -112,3 +112,33 @@ def test_initial_state_ablation_random_clone_and_zero():
 def test_initial_state_ablation_rejects_unknown_mode():
     with pytest.raises(ValueError, match="unsupported latent mode"):
         initial_state_for_mode(torch.zeros(1, 8), "future")
+
+
+
+def test_ridge_forecaster_uses_training_rows_only_and_returns_valid_schedules():
+    from scripts.evaluate_execution_grid import fit_ridge_forecaster, predict_ridge_schedule
+
+    rng = np.random.default_rng(31)
+    n = 180
+    features = rng.normal(size=(n, 45)).astype(np.float64)
+    mids = 100.0 * np.exp(np.cumsum(rng.normal(0, 1e-4, size=n)))
+    train_end = 120
+    model_a = fit_ridge_forecaster(features, mids, train_end, ctx_len=32, horizon=8, stride=4)
+    changed_features = features.copy()
+    changed_mids = mids.copy()
+    changed_features[train_end:] += 10000.0
+    changed_mids[train_end:] *= 2.0
+    model_b = fit_ridge_forecaster(changed_features, changed_mids, train_end, ctx_len=32, horizon=8, stride=4)
+    np.testing.assert_allclose(model_a["coefficients"], model_b["coefficients"], atol=0, rtol=0)
+    np.testing.assert_allclose(model_a["feature_mean"], model_b["feature_mean"], atol=0, rtol=0)
+    assert model_a["train_windows"] > 1
+    ctx = features[train_end - 32:train_end]
+    pred, buy = predict_ridge_schedule(model_a, ctx, "buy", 1.0)
+    _, sell = predict_ridge_schedule(model_a, ctx, "sell", 1.0)
+    assert pred.shape == (8,)
+    assert np.isfinite(pred).all()
+    assert np.isclose(buy.sum(), 1.0)
+    assert np.isclose(sell.sum(), 1.0)
+    assert (buy >= 0).all() and (sell >= 0).all()
+    with pytest.raises(ValueError):
+        predict_ridge_schedule(model_a, ctx, "hold", 1.0)

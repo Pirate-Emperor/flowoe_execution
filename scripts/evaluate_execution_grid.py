@@ -114,6 +114,84 @@ def initial_state_for_mode(x0: torch.Tensor, mode: str) -> torch.Tensor:
     raise ValueError(f"unsupported latent mode: {mode}")
 
 
+def ridge_descriptor(context: np.ndarray) -> np.ndarray:
+    """Compact causal descriptor: latest L2 features plus recent 8-row mean."""
+    x = np.asarray(context, dtype=np.float64)
+    if x.ndim != 2 or x.shape[0] < 8 or not np.isfinite(x).all():
+        raise ValueError("context must be a finite (T,D) array with T >= 8")
+    return np.concatenate([x[-1], x[-8:].mean(axis=0)])
+
+
+def fit_ridge_forecaster(
+    features: np.ndarray,
+    mids: np.ndarray,
+    train_end: int,
+    ctx_len: int = CTX_LEN,
+    horizon: int = HORIZON,
+    stride: int = 8,
+    regularization: float = 10.0,
+) -> dict:
+    """Fit a multi-horizon price-change ridge model using training rows only.
+
+    Every target horizon ends before train_end. Evaluation-period rows cannot
+    change the fit, feature means, or scaling.
+    """
+    x = np.asarray(features, dtype=np.float64)
+    p = np.asarray(mids, dtype=np.float64)
+    if x.ndim != 2 or p.ndim != 1 or len(x) != len(p):
+        raise ValueError("features and mids must be aligned 2-D/1-D arrays")
+    if not 0 < train_end <= len(x) or ctx_len < 8 or horizon < 1 or stride < 1:
+        raise ValueError("invalid train boundary or forecast dimensions")
+    if not np.isfinite(x[:train_end]).all() or not np.isfinite(p[:train_end]).all() or (p[:train_end] <= 0).any():
+        raise ValueError("training data must be finite with positive mid prices")
+    if not np.isfinite(regularization) or regularization <= 0:
+        raise ValueError("regularization must be finite and positive")
+    xs, ys = [], []
+    for start in range(0, train_end - ctx_len - horizon + 1, stride):
+        cut = start + ctx_len
+        xs.append(ridge_descriptor(x[start:cut]))
+        ys.append(np.log(p[cut:cut + horizon] / p[cut - 1]) * 1e4)
+    if len(xs) < 2:
+        raise ValueError("not enough training windows for ridge forecaster")
+    xs = np.asarray(xs)
+    ys = np.asarray(ys)
+    x_mean, x_std = xs.mean(axis=0), xs.std(axis=0)
+    x_std[x_std < 1e-8] = 1.0
+    z = (xs - x_mean) / x_std
+    y_mean = ys.mean(axis=0)
+    gram = z.T @ z
+    beta = np.linalg.solve(gram + regularization * np.eye(gram.shape[0]), z.T @ (ys - y_mean))
+    return {
+        "feature_mean": x_mean,
+        "feature_std": x_std,
+        "target_mean_bps": y_mean,
+        "coefficients": beta,
+        "train_windows": int(len(xs)),
+        "train_end": int(train_end),
+        "context_length": int(ctx_len),
+        "horizon": int(horizon),
+        "stride": int(stride),
+        "regularization": float(regularization),
+    }
+
+
+def predict_ridge_schedule(model: dict, context: np.ndarray, side: str, strength: float) -> tuple[np.ndarray, np.ndarray]:
+    """Convert causal ridge price forecasts into a normalized child-order schedule."""
+    if side not in {"buy", "sell"} or not np.isfinite(strength) or strength <= 0:
+        raise ValueError("side must be buy/sell and strength must be finite and positive")
+    desc = ridge_descriptor(context)
+    pred_bps = ((desc - model["feature_mean"]) / model["feature_std"]) @ model["coefficients"]
+    pred_bps = pred_bps + model["target_mean_bps"]
+    sign = 1.0 if side == "buy" else -1.0
+    logits = -sign * strength * pred_bps
+    logits -= np.max(logits)
+    weights = np.exp(np.clip(logits, -60.0, 0.0))
+    schedule = weights / weights.sum()
+    if not np.isfinite(schedule).all() or np.any(schedule < 0) or not np.isclose(schedule.sum(), 1.0):
+        raise RuntimeError("ridge schedule normalization failed")
+    return pred_bps, schedule
+
+
 def evaluate_one(
     model: CFMPolicy,
     sampler: FixedStepCryptoSampler,
@@ -187,6 +265,9 @@ def main():
     ntrain = int(len(l2) * args.train_ratio)
     if ntrain <= CTX_LEN + HORIZON or ntrain >= len(l2) - HORIZON:
         raise SystemExit("Chronological split leaves no train/evaluation window")
+    mids = ((l2.bid0 + l2.ask0) / 2).to_numpy(dtype=np.float64)
+    ridge_model = fit_ridge_forecaster(features, mids, ntrain, ctx_len=CTX_LEN, horizon=HORIZON)
+    ridge_strengths = (0.5, 1.0, 2.0, 4.0)
     simulator = ExecutionSimulator(quantity=args.quantity, side=args.side)
     baselines: list[float] = []
     base_completion: list[float] = []
@@ -254,6 +335,28 @@ def main():
         base_completion.append(twap.completion)
         episode_record["twap_slippage_bps"] = twap.slippage_bps
         episode_record["twap_completion"] = twap.completion
+
+        for strength in ridge_strengths:
+            ridge_key = f"ridge_{strength:g}"
+            pred_bps, schedule = predict_ridge_schedule(
+                ridge_model, features[i - CTX_LEN:i], args.side, strength,
+            )
+            ridge_result = simulator.run(
+                window, schedule, benchmark="trade_vwap", trades=trades,
+                strategy=ridge_key,
+            )
+            methods.setdefault(ridge_key, {"baseline": [], "slippage": [], "completion": [], "schedule_errors": []})
+            methods[ridge_key]["baseline"].append(twap.slippage_bps)
+            methods[ridge_key]["slippage"].append(ridge_result.slippage_bps)
+            methods[ridge_key]["completion"].append(ridge_result.completion)
+            ridge_tensor = torch.as_tensor(schedule, dtype=references[latent_modes[0]].dtype, device=device).unsqueeze(0)
+            methods[ridge_key]["schedule_errors"].append(compare_schedules(references[latent_modes[0]], ridge_tensor))
+            episode_record["methods"][ridge_key] = {
+                "slippage_bps": ridge_result.slippage_bps,
+                "completion": ridge_result.completion,
+                "predicted_path_bps": pred_bps.tolist(),
+                "schedule": schedule.tolist(),
+            }
 
         for mode in latent_modes:
             x_init = latent_states[mode]
@@ -363,6 +466,16 @@ def main():
         "rk4_steps": args.rk4_steps,
         "euler_steps": euler_steps,
         "latent_modes": latent_modes,
+        "ridge_forecaster": {
+            "train_windows": ridge_model["train_windows"],
+            "train_end_index_exclusive": ridge_model["train_end"],
+            "context_length": ridge_model["context_length"],
+            "horizon": ridge_model["horizon"],
+            "stride": ridge_model["stride"],
+            "regularization": ridge_model["regularization"],
+            "schedule_strengths": list(ridge_strengths),
+            "fit_uses_evaluation_rows": False,
+        },
         "context_len": CTX_LEN,
         "horizon": HORIZON,
         "evaluation_stride_snapshots": HORIZON * 3,
