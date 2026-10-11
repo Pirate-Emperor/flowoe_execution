@@ -103,7 +103,9 @@ def parse_steps_grid(value: str, anchor: int = 4) -> list[int]:
         vals = {int(part.strip()) for part in value.split(",") if part.strip()}
     except ValueError as exc:
         raise ValueError("steps-grid must be comma-separated integers") from exc
-    if not vals or min(vals) < 2:
+    if not vals:
+        raise ValueError("steps-grid must not be empty")
+    if min(vals) < 2:
         raise ValueError("every step-grid value must be at least 2")
     vals.add(int(anchor))
     return sorted(vals)
