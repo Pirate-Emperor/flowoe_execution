@@ -236,6 +236,7 @@ def main():
     ap.add_argument("--rk4-steps", type=int, default=24)
     ap.add_argument("--euler-steps", default="2,3,4,6")
     ap.add_argument("--latent-modes", default="random", help="Comma-separated modes: random,zero")
+    ap.add_argument("--dataset-label", default="unknown", help="Independent market window/date label")
     ap.add_argument("--include-fused", action="store_true")
     ap.add_argument("--fused-max-error", type=float, default=1e-4)
     ap.add_argument("--max-l2-rows", type=int, default=200000)
@@ -511,6 +512,7 @@ def main():
         "rk4_steps": args.rk4_steps,
         "euler_steps": euler_steps,
         "latent_modes": latent_modes,
+        "dataset_label": args.dataset_label,
         "ridge_forecaster": {
             "train_windows": ridge_model["train_windows"],
             "train_end_index_exclusive": ridge_model["train_end"],

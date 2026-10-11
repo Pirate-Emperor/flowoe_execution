@@ -250,6 +250,7 @@ def main():
     ap.add_argument("--sides", default="buy,sell")
     ap.add_argument("--euler-steps", default="2,3,4,6")
     ap.add_argument("--latent-modes", default="random", help="Comma-separated execution latent ablations")
+    ap.add_argument("--dataset-label", default="unknown", help="Independent market window/date label")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--quantity", type=float, default=0.5)
     ap.add_argument("--train-ratio", type=float, default=0.60)
@@ -288,6 +289,7 @@ def main():
         "trades_path": str(trades), "trades_sha256": file_hash(trades),
         "seeds": seeds, "sides": sides, "euler_steps": euler_steps,
         "latent_modes": latent_modes,
+        "dataset_label": args.dataset_label,
         "epochs": args.epochs, "quantity": args.quantity, "train_ratio": args.train_ratio,
         "include_fused": args.include_fused, "runs": [],
     }
@@ -327,6 +329,7 @@ def main():
                     "--train-ratio", str(args.train_ratio), "--seed", str(seed),
                     "--euler-steps", ",".join(str(x) for x in euler_steps),
                     "--latent-modes", args.latent_modes,
+                    "--dataset-label", args.dataset_label,
                     "--max-l2-rows", "200000", "--report", str(eval_report),
                 ]
                 if args.include_fused:
