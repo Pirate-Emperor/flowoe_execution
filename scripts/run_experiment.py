@@ -147,15 +147,13 @@ def main():
                     help='Execution inference path: RK4 reference, PyTorch Euler, or fused CUDA Euler.')
     ap.add_argument('--sampling-steps', type=int, default=None,
                     help='Defaults: 24 for RK4; 4 for fixed/fused Euler. Euler steps count grid points, so there are steps-1 updates.')
-    if args.epochs < 1 or args.early_stopping_patience < 1:
-        ap.error("epochs and early-stopping-patience must be positive")
     ap.add_argument('--allow-book-vwap', action='store_true', help='Allow the depth-weighted proxy for a real run (not a trade-VWAP evidence run).')
     ap.add_argument('--side', choices=['buy', 'sell'], default='buy')
     ap.add_argument('--quantity', type=float, default=1.0)
     ap.add_argument('--instrument', default='BTCUSDT')
     args = ap.parse_args()
-    if args.epochs < 1:
-        ap.error('--epochs must be positive')
+    if args.epochs < 1 or args.early_stopping_patience < 1:
+        ap.error('--epochs and --early-stopping-patience must be positive')
     if not 0.1 <= args.train_ratio <= 0.9:
         ap.error('--train-ratio must be between 0.1 and 0.9')
     if args.quantity <= 0:
