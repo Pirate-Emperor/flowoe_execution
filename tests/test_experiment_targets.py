@@ -261,3 +261,24 @@ def test_parse_quantity_grid_keeps_base_quantity_and_rejects_bad_sizes():
         parse_quantity_grid("1,-2", 0.5)
     with pytest.raises(ValueError, match="positive"):
         parse_quantity_grid("nan,2", 0.5)
+
+
+
+def test_chronological_window_split_embargo_prevents_raw_row_overlap():
+    from scripts.run_experiment import chronological_window_split
+
+    n, context, horizon, stride = 160, 32, 8, 8
+    fit_end, val_start = chronological_window_split(n, context, horizon, stride)
+    assert 0 < fit_end < val_start < n
+    last_fit_end_row = (fit_end - 1) * stride + context + horizon - 1
+    first_val_start_row = val_start * stride
+    assert last_fit_end_row < first_val_start_row
+
+
+def test_chronological_window_split_disables_validation_when_too_small():
+    from scripts.run_experiment import chronological_window_split
+
+    fit_end, val_start = chronological_window_split(12, context_len=32, horizon=8, stride=8)
+    assert fit_end == val_start == 12
+    with pytest.raises(ValueError):
+        chronological_window_split(100, val_fraction=0.5)

@@ -13,6 +13,59 @@ from flowoe_execution.provenance import source_revision, utc_now, workflow_revis
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def chronological_window_split(n_windows, context_len=32, horizon=8, stride=8, val_fraction=0.2):
+    """Split overlapping windows chronologically, with a raw-row embargo.
+
+    Returns (fit_end, val_start) as exclusive/inclusive window boundaries.
+    If the dataset is too small to leave at least two disjoint validation windows,
+    returns (n_windows, n_windows), disabling validation rather than leaking.
+    """
+    import math
+    if n_windows < 1 or context_len < 1 or horizon < 1 or stride < 1:
+        raise ValueError("window count, context, horizon and stride must be positive")
+    if not 0.0 < val_fraction < 0.5:
+        raise ValueError("val_fraction must be in (0, 0.5)")
+    fit_end = max(1, int(n_windows * (1.0 - val_fraction)))
+    embargo = math.ceil((context_len + horizon) / stride)
+    val_start = fit_end + embargo
+    if n_windows - val_start < 2:
+        return n_windows, n_windows
+    return fit_end, val_start
+
+
+def cfm_validation_loss(model, contexts, targets, device, seed=20261011, batch_size=64):
+    """Measure deterministic CFM validation loss without changing training RNG."""
+    if len(contexts) != len(targets):
+        raise ValueError("validation contexts and targets must be aligned")
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if not contexts:
+        return None
+    was_training = model.training
+    devices = []
+    if device.type == "cuda":
+        devices = [device.index if device.index is not None else torch.cuda.current_device()]
+    total = 0.0
+    count = 0
+    try:
+        model.eval()
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(int(seed))
+            if device.type == "cuda":
+                torch.cuda.manual_seed_all(int(seed))
+            with torch.no_grad():
+                for start in range(0, len(contexts), batch_size):
+                    end = min(start + batch_size, len(contexts))
+                    ctx = torch.stack(contexts[start:end]).to(device)
+                    y = torch.stack(targets[start:end]).to(device)
+                    loss = model.cfm_loss(ctx, y, "crypto")
+                    total += float(loss.item()) * len(ctx)
+                    count += len(ctx)
+    finally:
+        model.train(was_training)
+    return total / max(count, 1)
+
+
 def fi_training_windows(features, labels, train_ratio, context_len=32, stride=8, max_label_horizon=10):
     """Build chronological FI windows without labels crossing the train split.
 
@@ -74,6 +127,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--smoke', action='store_true')
     ap.add_argument('--epochs', type=int, default=120)
+    ap.add_argument('--early-stopping-patience', type=int, default=20)
     ap.add_argument('--seed', type=int, default=7, help='Random seed for initialization, training order and sampling.')
     ap.add_argument('--data-source', choices=['user_supplied', 'public_futures'], default='user_supplied',
                     help='Provenance of the non-synthetic market files; use public_futures only after independent validation.')
@@ -93,6 +147,8 @@ def main():
                     help='Execution inference path: RK4 reference, PyTorch Euler, or fused CUDA Euler.')
     ap.add_argument('--sampling-steps', type=int, default=None,
                     help='Defaults: 24 for RK4; 4 for fixed/fused Euler. Euler steps count grid points, so there are steps-1 updates.')
+    if args.epochs < 1 or args.early_stopping_patience < 1:
+        ap.error("epochs and early-stopping-patience must be positive")
     ap.add_argument('--allow-book-vwap', action='store_true', help='Allow the depth-weighted proxy for a real run (not a trade-VWAP evidence run).')
     ap.add_argument('--side', choices=['buy', 'sell'], default='buy')
     ap.add_argument('--quantity', type=float, default=1.0)
@@ -165,16 +221,25 @@ def main():
         max_label_horizon=10,
     )
 
+    fit_end, val_start = chronological_window_split(len(train_ctx), ctx_n, horizon, stride)
+    fit_ctx, fit_y = train_ctx[:fit_end], train_y[:fit_end]
+    val_ctx, val_y = train_ctx[val_start:], train_y[val_start:]
     torch.set_num_threads(2)
     model = CFMPolicy(horizon=horizon).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
     model.train(); t0 = time.perf_counter()
+    best_val = float('inf')
+    best_epoch = None
+    best_state = None
+    stale_epochs = 0
+    epochs_trained = 0
+    min_epochs = min(args.epochs, max(5, args.epochs // 5))
     for ep in range(args.epochs):
-        order = np.random.default_rng(args.seed + ep).permutation(len(train_ctx))
+        order = np.random.default_rng(args.seed + ep).permutation(len(fit_ctx))
         for j in range(0, len(order), 64):
             b = order[j:j+64]
-            c = torch.stack([train_ctx[k] for k in b]).to(device)
-            y = torch.stack([train_y[k] for k in b]).to(device)
+            c = torch.stack([fit_ctx[k] for k in b]).to(device)
+            y = torch.stack([fit_y[k] for k in b]).to(device)
             loss = model.cfm_loss(c, y, 'crypto')
             opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
         if fi_ctx:
@@ -183,6 +248,22 @@ def main():
             y = torch.stack([fi_targets[k] for k in idx]).to(device)
             loss = model.fi_aux_loss(c, y, label_encoding='zero_one_two')
             opt.zero_grad(); loss.backward(); opt.step()
+        epochs_trained = ep + 1
+        if val_ctx:
+            val_loss = cfm_validation_loss(
+                model, val_ctx, val_y, device, seed=args.seed + 91000,
+            )
+            if val_loss < best_val - 1e-7:
+                best_val = val_loss
+                best_epoch = ep + 1
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            if epochs_trained >= min_epochs and stale_epochs >= args.early_stopping_patience:
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
     train_s = time.perf_counter() - t0
@@ -257,7 +338,17 @@ def main():
         'l2_path': str(l2_path), 'l2_sha256': file_sha256(l2_path),
         'trades_path': str(trade_path) if trade_path else None,
         'trades_sha256': file_sha256(trade_path) if trade_path else None,
-        'train_windows': len(train_ctx), 'fi_windows': len(fi_ctx),
+        'train_windows': len(fit_ctx),
+        'available_crypto_training_windows': len(train_ctx),
+        'validation_windows': len(val_ctx),
+        'validation_embargo_windows': val_start - fit_end,
+        'best_validation_cfm_loss': best_val if best_epoch is not None else None,
+        'best_validation_epoch': best_epoch,
+        'epochs_requested': args.epochs,
+        'epochs_trained': epochs_trained,
+        'early_stopping_patience': args.early_stopping_patience,
+        'early_stopping_enabled': bool(val_ctx),
+        'fi_windows': len(fi_ctx),
         'fi_label_encoding_detected': fi_label_encoding,
         'epochs': args.epochs, 'training_seconds': train_s, 'episodes': len(policy),
         'twap_slippage_bps': twap_stats,
