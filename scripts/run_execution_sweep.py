@@ -70,6 +70,17 @@ def load_json(path: Path) -> dict:
         return {}
 
 
+def matched_twap_baseline(episode: dict, method_result: dict) -> float:
+    """Use the same order-size TWAP as the policy for paired pooled intervals."""
+    quantity = method_result.get("quantity_btc")
+    by_quantity = episode.get("twap_slippage_by_quantity_bps", {})
+    if quantity is not None:
+        key = f"{float(quantity):g}"
+        if key in by_quantity:
+            return float(by_quantity[key])
+    return float(episode["twap_slippage_bps"])
+
+
 def aggregate_reports(records: list[dict]) -> dict:
     groups: dict[tuple[str, str], list[dict]] = {}
     episode_groups: dict[tuple[str, str], dict[int, dict[str, dict]]] = {}
@@ -101,7 +112,7 @@ def aggregate_reports(records: list[dict]) -> dict:
                 window_key = f"{start}|{end}"
                 seed_windows[window_key] = {
                     "episode_index": int(episode.get("episode_index", len(seed_windows))),
-                    "twap_slippage_bps": float(episode["twap_slippage_bps"]),
+                    "twap_slippage_bps": matched_twap_baseline(episode, episode_method),
                     "policy_slippage_bps": float(episode_method["slippage_bps"]),
                 }
 
@@ -179,7 +190,7 @@ def write_markdown(path: Path, manifest: dict) -> None:
         f"- Euler step counts: {', '.join(str(x) for x in manifest['euler_steps'])}",
         f"- Fused path requested: {manifest['include_fused']}",
         "",
-        "The first table averages per-seed results. Per-seed confidence intervals use paired moving-block bootstrap. The pooled intervals below average the three seed fits for each shared timestamp before a paired circular moving-block bootstrap; they remain conditional on this single held-out market window. The market execution simulator is not a live exchange order-fill model.",
+        "The first table averages per-seed results. Per-seed confidence intervals use paired moving-block bootstrap. The pooled intervals use the matching order-size TWAP baseline for quantity-specific methods, average the three seed fits at shared timestamps, and then run a paired circular moving-block bootstrap; they remain conditional on this single held-out market window. The market execution simulator is not a live exchange order-fill model.",
         "",
         "## Results by side and sampler",
         "",
