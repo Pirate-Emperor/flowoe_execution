@@ -158,7 +158,7 @@ def aggregate_cross_date(reports: list[dict], target_bps: float = 2.4,
             "positive_lower_confidence_bound": bool(ci[0] > 0),
             "accept_as_target_evidence": bool(
                 len(days) >= min_dates and equal_day_mean >= target_bps and ci[0] > 0
-                and all(d["mean_completion"] >= 0.99 for d in days)
+                and all(d["mean_completion"] >= 0.99 and d["seed_count"] >= 3 for d in days)
             ),
         }
     return {
