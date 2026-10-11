@@ -254,6 +254,7 @@ def main():
     ap.add_argument("--quantity-grid", default="0.5,1,2,5,10", help="Execution-size sweep in BTCUSDT units")
     ap.add_argument("--dataset-label", default="unknown", help="Independent market window/date label")
     ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cuda")
     ap.add_argument("--quantity", type=float, default=0.5)
     ap.add_argument("--train-ratio", type=float, default=0.60)
     ap.add_argument("--include-fused", action="store_true")
@@ -322,7 +323,7 @@ def main():
             train_cmd = [
                 sys.executable, "scripts/run_experiment.py",
                 "--fi", str(fi), "--l2", str(l2), "--trades", str(trades),
-                "--epochs", str(args.epochs), "--device", "cuda",
+                "--epochs", str(args.epochs), "--device", args.device,
                 "--fi-max-rows", "50000", "--l2-max-rows", "200000",
                 "--train-ratio", str(args.train_ratio), "--quantity", str(args.quantity),
                 "--instrument", "BTCUSDT", "--side", side, "--seed", str(seed),
