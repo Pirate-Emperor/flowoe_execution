@@ -159,3 +159,23 @@ def test_geometric_schedule_blend_endpoints_and_validation():
         blend_schedules(p, q, 1.1)
     with pytest.raises(ValueError, match="finite"):
         blend_schedules(np.array([0.1, np.nan, 0.9]), q, 0.5)
+
+
+
+def test_cross_date_block_bootstrap_preserves_separate_dates_and_is_reproducible():
+    from scripts.aggregate_execution_sweeps import cross_date_block_bootstrap_ci
+
+    days = [[1.0] * 12, [3.0] * 12, [5.0] * 12]
+    a = cross_date_block_bootstrap_ci(days, seed=17, n_boot=500, block_size=3)
+    b = cross_date_block_bootstrap_ci(days, seed=17, n_boot=500, block_size=3)
+    assert a == b
+    assert a[0] <= 3.0 <= a[1]
+
+
+def test_cross_date_block_bootstrap_rejects_empty_or_nonfinite_series():
+    from scripts.aggregate_execution_sweeps import cross_date_block_bootstrap_ci
+
+    with pytest.raises(ValueError):
+        cross_date_block_bootstrap_ci([])
+    with pytest.raises(ValueError):
+        cross_date_block_bootstrap_ci([[1.0, float("nan")]])
