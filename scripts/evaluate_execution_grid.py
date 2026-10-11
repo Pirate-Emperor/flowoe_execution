@@ -105,6 +105,15 @@ def resolve_input(arg: str | None, patterns: list[str], label: str) -> Path:
     return matches[0]
 
 
+def initial_state_for_mode(x0: torch.Tensor, mode: str) -> torch.Tensor:
+    """Choose the initial state for a controlled latent ablation."""
+    if mode == "random":
+        return x0.clone()
+    if mode == "zero":
+        return torch.zeros_like(x0)
+    raise ValueError(f"unsupported latent mode: {mode}")
+
+
 def evaluate_one(
     model: CFMPolicy,
     sampler: FixedStepCryptoSampler,
@@ -129,6 +138,7 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--rk4-steps", type=int, default=24)
     ap.add_argument("--euler-steps", default="2,3,4,6")
+    ap.add_argument("--latent-modes", default="random", help="Comma-separated modes: random,zero")
     ap.add_argument("--include-fused", action="store_true")
     ap.add_argument("--fused-max-error", type=float, default=1e-4)
     ap.add_argument("--max-l2-rows", type=int, default=200000)
@@ -146,6 +156,9 @@ def main():
         ap.error("--euler-steps must be comma-separated integers")
     if not euler_steps or min(euler_steps) < 2:
         ap.error("every Euler step count must be at least 2")
+    latent_modes = list(dict.fromkeys(x.strip() for x in args.latent_modes.split(",") if x.strip()))
+    if not latent_modes or any(x not in {"random", "zero"} for x in latent_modes):
+        ap.error("latent-modes must be a comma-separated subset of random,zero")
 
     checkpoint = Path(args.checkpoint)
     if not checkpoint.is_absolute():
