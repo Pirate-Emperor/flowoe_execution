@@ -100,3 +100,24 @@ def test_selu_converter_rejects_tensor_without_trt_value():
 
     with pytest.raises(RuntimeError, match="not been converted"):
         add_selu_activation(object(), object(), FakeTRT)
+
+
+
+def test_combined_trt_fused_gate_requires_all_three_conditions():
+    from scripts.benchmark_trt_fused import gate
+
+    passed = gate(0.01, 0.02, 0.008, 0.015, 0.004, 0.01, 1.8)
+    assert passed["sub_2ms_p99_and_quality_target_met"] is True
+    too_slow = gate(0.01, 0.02, 0.008, 0.015, 0.004, 0.01, 2.0)
+    assert too_slow["sub_2ms_p99_and_quality_target_met"] is False
+    bad_path = gate(0.03, 0.02, 0.008, 0.015, 0.004, 0.01, 1.0)
+    assert bad_path["sub_2ms_p99_and_quality_target_met"] is False
+    bad_quality = gate(0.01, 0.02, 0.02, 0.015, 0.004, 0.01, 1.0)
+    assert bad_quality["sub_2ms_p99_and_quality_target_met"] is False
+
+
+def test_combined_trt_fused_gate_rejects_invalid_values():
+    from scripts.benchmark_trt_fused import gate
+
+    with pytest.raises(ValueError, match="finite"):
+        gate(float("nan"), 0.02, 0.008, 0.015, 0.004, 0.01, 1.0)
